@@ -5427,3 +5427,440 @@ registerIncomingHandler	(registration) => () => void
 unregisterIncomingHandler	(registration) => boolean
 registerIncomingStanzaFilter	(filter) => () => void
 Inbound nodes are also observable read-only via the debug_transport_node_in / debug_transport_node_out events — handy for discovering stanza shapes before you write a handler.
+
+Stores reference
+
+Configuration reference for the SQLite, PostgreSQL, MySQL, Redis, and MongoDB store backend packages, including fields, defaults, and examples.
+
+Each backend package exports a create*Store factory you pass into a backends entry of createStore. All backends implement the same per-domain store contracts, so switching backends is a config change, not a code change.
+The backend type is WaStoreBackend<S, C> — both parameters default to the full domain matrix (every persistence domain plus every cache domain). Every bundled @zapo-js/store-* package ships a full backend; a hand-written partial backend narrows itself with WaStoreBackend<S, C> and createStore() refuses undeclared domains at compile time. See Custom backends.
+​
+SQLite
+@zapo-js/store-sqlite — createSqliteStore(config).
+import { createSqliteStore } from '@zapo-js/store-sqlite'
+
+const sqlite = createSqliteStore({
+  path: '.auth/state.sqlite',
+  driver: 'auto'
+})
+Field	Type	Description
+path	string	Database file path. Mutually exclusive with connection.
+connection	WaSqliteConnection	Pre-opened connection to reuse. Mutually exclusive with path.
+driver	WaSqliteDriver	Native driver selection ('auto', …). Ignored when connection is set.
+pragmas	Record<string, string | number>	SQLite pragmas. Ignored when connection is set.
+tableNames	WaSqliteTableNameOverrides	Override table names. Ignored when connection is set.
+batchSizes	WaSqliteBatchSizeSelection	Tune batch sizes.
+cacheTtlMs	{ retryMs?, groupMetadataMs?, chatMetadataMs?, deviceListMs?, messageSecretMs? }	Cache TTLs.
+Provide exactly one of path or connection. With path, the library opens (and ref-counts) its own connection and closes it on store.destroy(). With connection, you own the lifecycle — store.destroy() leaves it open so you can keep using it elsewhere.
+​
+Bring your own connection
+Share a single SQLite handle with the rest of your application by opening it yourself with openSqliteConnection and passing it through connection:
+import { createStore } from 'zapo-js'
+import { createSqliteStore, openSqliteConnection } from '@zapo-js/store-sqlite'
+
+const connection = await openSqliteConnection({
+  path: 'app.sqlite',
+  sessionId: 'shared',
+  pragmas: { journal_mode: 'WAL', synchronous: 'NORMAL' }
+})
+
+const store = createStore({
+  backends: { sqlite: createSqliteStore({ connection }) },
+  providers: {
+    auth: 'sqlite',
+    signal: 'sqlite',
+    preKey: 'sqlite',
+    session: 'sqlite',
+    identity: 'sqlite',
+    senderKey: 'sqlite',
+    appState: 'sqlite',
+    privacyToken: 'sqlite',
+    messages: 'none',
+    threads: 'none',
+    contacts: 'none'
+  }
+})
+
+// ... use connection elsewhere in your app ...
+
+await store.destroy()
+connection.close() // you opened it, you close it
+Requires the better-sqlite3 peer dependency.
+​
+PostgreSQL
+@zapo-js/store-postgres — createPostgresStore(config).
+import { createPostgresStore } from '@zapo-js/store-postgres'
+
+const postgres = createPostgresStore({
+  pool: { connectionString: process.env.DATABASE_URL },
+  tablePrefix: 'wa_'
+})
+Field	Type	Description
+pool	Pool | PoolConfig	An existing pg pool or a pool config. Required.
+tablePrefix	string	Prefix for created tables.
+cacheTtlMs	object	Cache TTLs (same shape as SQLite).
+cleanup	{ intervalMs?, onError? }	Background cleanup poller.
+batchInsertChunkSize	number	Upper bound on rows per multi-row INSERT in batch writes. Default 500. See Batch insert chunking.
+Also exports createPgPool and ensurePgMigrations. Requires the pg peer dependency.
+​
+MySQL
+@zapo-js/store-mysql — createMysqlStore(config).
+import { createMysqlStore } from '@zapo-js/store-mysql'
+
+const mysql = createMysqlStore({
+  pool: { uri: process.env.MYSQL_URL },
+  tablePrefix: 'wa_'
+})
+Field	Type	Description
+pool	Pool | PoolOptions	A mysql2 pool or options. Required.
+tablePrefix	string	Prefix for created tables.
+cacheTtlMs	object	Cache TTLs.
+cleanup	{ enabled?, intervalMs?, onError? }	Background cleanup poller.
+batchInsertChunkSize	number	Upper bound on rows per multi-row INSERT in batch writes. Default 500. See Batch insert chunking.
+Also exports createMysqlPool and ensureMysqlMigrations. Requires the mysql2 peer dependency.
+​
+Batch insert chunking
+batchInsertChunkSize caps how many rows the PostgreSQL and MySQL backends fold into a single multi-row INSERT for batch writes — Signal sessions, remote identities, sender-key distributions, prekey generation, and the message/thread/contact upsertBatch paths used by write-behind persistence.
+The value is rounded down to the nearest power of two internally (500 → 256, 1000 → 512, …), and each batch is decomposed into power-of-two sub-chunks. That keeps the set of distinct prepared statements per connection bounded at log2(chunkSize) + 1 regardless of how N varies between calls — important for staying under the mysql2 client-side cache and MySQL’s max_prepared_stmt_count quota, and for keeping pg’s named statement cache stable.
+Leave the default unless benchmarks for your workload show it helps. Raise it for steady high-fanout group sends; lower it if your database limits are tight.
+createPostgresStore({
+  pool: { connectionString: process.env.DATABASE_URL },
+  batchInsertChunkSize: 2000 // → effective 1024
+})
+​
+Redis
+@zapo-js/store-redis — createRedisStore(config).
+import { createRedisStore } from '@zapo-js/store-redis'
+
+const redis = createRedisStore({
+  redis: { host: '127.0.0.1', port: 6379 },
+  keyPrefix: 'wa:'
+})
+Field	Type	Description
+redis	Redis | RedisOptions	An ioredis instance or options. Required.
+keyPrefix	string	Prefix for all keys.
+cacheTtlMs	object	Cache TTLs.
+storeTtlMs	object	Opt-in per-domain TTL on the otherwise-persistent stores (see Per-domain store TTL).
+​
+Per-domain store TTL
+Persistent store domains never expire by default. Set storeTtlMs.<domain>Ms to make Redis prune that domain’s keys automatically — implemented as PEXPIRE on each write, no background cleanup needed. Any domain left unset stays persistent (byte-identical to the previous behavior).
+createRedisStore({
+  redis: { host: '127.0.0.1', port: 6379 },
+  storeTtlMs: {
+    messagesMs: 30 * 24 * 60 * 60_000, // drop messages older than 30 days
+    sessionMs:   7 * 24 * 60 * 60_000  // drop sessions idle for 7 days
+  }
+})
+Two semantics, by domain kind:
+Group	Domains	Refresh on
+Data	messagesMs, threadsMs, contactsMs, privacyTokenMs	write only — keys expire a fixed window after their last update (history / retention bounding).
+Crypto & session	preKeyMs, sessionMs, identityMs, signalMs, senderKeyMs, appStateMs	read and write (sliding) — an actively used session keeps its keys alive, only idle sessions are evicted.
+auth has no TTL knob on purpose: expiring login credentials would log the device out. Pick a crypto TTL longer than your worst idle window — an idle session beyond that window evicts the Signal / app-state keys and forces a re-handshake or re-sync. Non-positive ttlMs values are rejected at construction.
+Requires the ioredis peer dependency.
+​
+MongoDB
+@zapo-js/store-mongo — createMongoStore(config).
+import { createMongoStore } from '@zapo-js/store-mongo'
+
+const mongo = createMongoStore({
+  db: { uri: process.env.MONGO_URL, database: 'zapo' },
+  collectionPrefix: 'wa_'
+})
+Field	Type	Description
+db	Db | { uri, database, options? }	A mongodb Db or connection info. Required.
+collectionPrefix	string	Prefix for created collections.
+cacheTtlMs	object	Cache TTLs.
+Requires the mongodb peer dependency.
+Bulk writes use { ordered: false } so independent upserts run in parallel — a per-document failure does not abort the rest of the batch.
+​
+Cache expiry and cleanup
+The five cache domains (retry, groupMetadata, chatMetadata, deviceList, messageSecret) carry a TTL set through cacheTtlMs. How expired entries are evicted differs per backend:
+Backend	Mechanism	Action required
+memory	Periodic in-process sweep (interval min(60s, ttl/2), unref()-ed timer)	None — automatic
+sqlite	Filter on read; expired rows are skipped and overwritten on next upsert	None
+postgres	Filter on read + background poller deletes expired rows	Call startCleanup(sessionId)
+mysql	Filter on read + background poller deletes expired rows	Call startCleanup(sessionId)
+redis	Native key EXPIRE	None
+mongo	TTL index (server-side monitor, ~60s sweep latency)	None
+For PostgreSQL and MySQL, without startCleanup your cache tables grow monotonically. Reads still ignore expired rows so stale data is never served, but disk usage climbs forever. Start one poller per session id.
+const result = createPostgresStore({
+  pool: { connectionString: process.env.DATABASE_URL },
+  cleanup: { intervalMs: 60_000, onError: (e) => log.warn('cache cleanup failed', e) }
+})
+
+const store = createStore({ backends: { pg: result }, providers: { /* ... */ } })
+const client = new WaClient({ store, sessionId: 'default' }, logger)
+
+const poller = result.startCleanup('default')
+
+process.on('SIGTERM', async () => {
+  await client.disconnect()
+  await result.destroy() // also stops every poller it tracks
+})
+cleanup.intervalMs defaults to 60_000 (60s). result.destroy() stops every poller started through it, so calling poller.stop() yourself is only useful if you want to halt cleanup before tearing down the backend.
+For MongoDB, the TTL monitor’s ~60s latency means cache entries can linger past the configured TTL. Acceptable for groupMetadata/deviceList; switch to Redis if you need tighter eviction.
+​
+Mixing backends
+createStore lets each domain choose a backend by name, so you can combine them:
+createStore({
+  backends: { redis, postgres },
+  providers: {
+    auth: 'redis',
+    signal: 'redis',
+    preKey: 'redis',
+    session: 'redis',
+    identity: 'redis',
+    senderKey: 'redis',
+    appState: 'redis',
+    privacyToken: 'redis',
+    messages: 'postgres',
+    threads: 'postgres',
+    contacts: 'postgres'
+  }
+})
+Every persistence domain must be listed once backends is set — see Stores for the rule and the accepted values ('<backend>', 'memory', 'none').
+
+JIDs, helpers & constants
+
+Build, parse, and inspect WhatsApp JIDs, plus every WA_* protocol constant exported from the zapo-js package root for use in your own code.
+
+A JID (Jabber ID) is how WhatsApp addresses every entity. zapo exports a set of helpers to build and classify them, all from the package root:
+import { parsePhoneJid, isGroupJid, splitJid } from 'zapo-js'
+​
+JID shapes
+Entity	Example
+User (phone)	5511999999999@s.whatsapp.net
+Group	123456789-987654@g.us
+Newsletter / channel	120363000000000000@newsletter
+Status broadcast	status@broadcast
+LID (privacy id)	123456789@lid
+​
+Building JIDs
+// Phone number → user JID
+parsePhoneJid('5511999999999')        // '5511999999999@s.whatsapp.net'
+
+// Normalize anything into a recipient JID (accepts a number or string)
+normalizeRecipientJid('5511999999999')
+
+// Strip a device suffix down to the base user JID
+toUserJid('5511999999999:12@s.whatsapp.net') // '5511999999999@s.whatsapp.net'
+
+// Build a device-scoped JID
+buildDeviceJid('5511999999999', 's.whatsapp.net', 12)
+​
+Parsing & splitting
+splitJid('5511999999999@s.whatsapp.net')  // { user, server }
+parseJidFull(jid)                         // ParsedJid with full breakdown
+parseSignalAddressFromJid(jid)            // { user, server, device }
+​
+Classifying JIDs
+Boolean predicates for routing logic:
+Helper	True for
+isGroupJid(jid)	Group (@g.us)
+isGroupOrBroadcastJid(jid)	Group or broadcast
+isBroadcastJid(jid)	Broadcast list
+isStatusBroadcastJid(jid)	status@broadcast
+isNewsletterJid(jid)	Newsletter (@newsletter)
+isLidJid(jid)	LID (@lid)
+isBotJid(jid)	A bot (@bot)
+isHostedDeviceJid(jid)	Hosted device
+client.on('message', (event) => {
+  if (isGroupJid(event.key.remoteJid)) {
+    console.log('a group message')
+  }
+})
+​
+Constants
+The full set of protocol constants is exported as frozen WA_* objects (the library uses these instead of TypeScript enums). The most commonly used:
+Constant	Contains
+WA_DEFAULTS	Default timeouts, the status-broadcast JID, the default device browser, …
+WA_BROWSERS	Browser identifiers for the device fingerprint.
+WA_PRIVACY_CATEGORIES / WA_PRIVACY_VALUES / WA_PRIVACY_SETTING_VALUES / WA_PRIVACY_ACCOUNT_SYNC_DISALLOWED_LISTS / WA_PRIVACY_DISALLOWED_LIST_CATEGORIES	Privacy setting names, allowed values per setting, the four disallowed-list categories refreshed on an account-sync, and the eligible deny-list categories.
+WA_DISCONNECT_REASONS / WA_LOGOUT_REASONS	Reason strings on connection events.
+WA_MESSAGE_TYPES / WA_MESSAGE_TAGS	Message classification.
+WA_NODE_TAGS / WA_XMLNS	Protocol node tags and XML namespaces.
+WA_APP_STATE_COLLECTIONS	App-state collection names.
+WA_ABPROPS / WA_ABPROPS_BY_CODE / WA_GROUP_ABPROPS / WA_GROUP_ABPROPS_BY_CODE	Full AB-props catalogue vendored from the WA Web bundle (2151 user props + 14 group props). Each entry carries code, type ('bool' | 'int' | 'float' | 'string'), defaultValue and debugDefaultValue.
+import { WA_DEFAULTS, WA_LOGOUT_REASONS } from 'zapo-js'
+
+await client.logout(WA_LOGOUT_REASONS.USER_INITIATED)
+Associated string-literal types are also exported for annotation: WaPrivacyCategory, WaPrivacySettingName, WaPrivacyValue, WaDisconnectReason, WaLogoutReason, WaConnectionCode, WaStreamErrorCode, WaFailureReasonCode, WaAbPropName, WaAbPropType, WaAbPropValue, WaAbPropValueByName, WaGroupAbPropName, WaGroupAbPropValueByName, and ParsedJid.
+​
+Deprecated AB-props aliases
+The previous 133-entry hand-maintained table is gone, but the older surface stays exported from zapo-js/protocol as a compatibility view over the vendored catalogue:
+AB_PROP_CONFIGS — a view over WA_ABPROPS that keeps the historical configCode field name (aliased to code) with literal types preserved.
+AbPropName / AbPropType / AbPropValue — aliases of WaAbPropName / WaAbPropType / WaAbPropValue. AbPropType now also covers 'float'.
+Prefer the Wa* names for new code. The catalogue lookup by wire id is resolveAbPropNameByCode(code).
+​
+Message helpers
+Two helpers for inspecting and targeting messages, exported from the package root:
+Export	Signature	Description
+getContentType	(content?: Proto.IMessage) => keyof Proto.IMessage | undefined	Returns the populated content-type key ('conversation', 'imageMessage', 'extendedTextMessage', …) of a message, or undefined for an empty message. Skips senderKeyDistributionMessage so group messages report their real payload kind.
+resolveMessageTarget	(ref: WaMessageTargetInput) => WaMessageKey	Normalizes a reply/edit/reaction/revoke/pin target into a bare WaMessageKey. Accepts an explicit WaMessageKey (returned as-is) or a received message event (rawNode-bearing reference — its key is returned). Throws when an event is passed without a valid key.id.
+import { getContentType, resolveMessageTarget } from 'zapo-js'
+
+client.on('message', (event) => {
+  console.log(getContentType(event.message)) // e.g. 'extendedTextMessage'
+  const key = resolveMessageTarget(event)    // identical to event.key for real events
+})
+​
+Other utilities
+Export	Purpose
+proto	The full protobuf namespace — build raw Proto.IMessage payloads.
+delay(ms)	Promise-based sleep.
+parseUsyncResultEnvelope	Parse a USync IQ result envelope.
+WA_VERSION	The bundled default WhatsApp Web version string the client advertises when version is omitted.
+​
+Device identity helpers
+Two low-level helpers reachable via the zapo-js/protocol subpath — useful when authoring a plugin that needs the same deviceBrowser / deviceOsDisplayName / devicePlatform resolution the client factory and auth client use, so its own payloads agree with the pairing ClientPayload.
+Export	Signature	Description
+resolveWaDeviceIdentity	(options: WaDeviceIdentityOptions) => WaDeviceIdentity	Resolves a fully-populated { browser, osDisplayName, platform } from raw options, applying the same defaults the client uses (browser falls back to WA_DEFAULTS.DEVICE_BROWSER, OS name to the runtime OS, platform inferred from the browser).
+getWaBrowserDisplayName	(browser: string) => string	The human-readable browser name advertised during pairing (e.g. 'chrome' → 'Chrome'). Unknown inputs are echoed back unchanged.
+import { resolveWaDeviceIdentity, getWaBrowserDisplayName } from 'zapo-js/protocol'
+
+const device = resolveWaDeviceIdentity({ deviceBrowser: 'firefox' })
+// { browser: 'firefox', osDisplayName: '<runtime OS>', platform: '3' }
+getWaBrowserDisplayName('firefox') // 'Firefox'
+
+Glossary
+
+Definitions of the WhatsApp protocol and zapo terms used across the docs: JID, LID, stanza, prekey, sender key, app-state, coordinator, fanout, Noise.
+
+Short definitions for the terms used across these docs. Most link to the page that covers them in depth.
+​
+addon
+An encrypted follow-up attached to a message — a reaction, poll vote, or comment. Surfaced as the message_addon event. See Receiving messages.
+​
+app-state
+The channel that syncs per-account settings (mute, pin, archive, read, labels, contacts) across all your devices — separate from messages. Driven via client.chat.
+​
+BinaryNode
+zapo’s representation of a protocol stanza: { tag, attrs, content }. The unit you work with in the low-level API.
+​
+broadcast list
+A business-only list that sends one message to many contacts at once — each receives it as a private 1:1 chat. Distinct from a newsletter/channel. See Broadcast lists.
+​
+companion device
+A linked-device connection (like WhatsApp Web/Desktop) — the default mode. Contrast with mobile connections. See Authentication.
+​
+coordinator
+A focused feature module reached through a getter on the client (client.message, client.group, …). See Architecture.
+​
+fanout
+Encrypting a single message once per recipient device and bundling the results into one stanza. See Architecture in depth.
+​
+IQ
+A request/response stanza (<iq type="get|set"> → result/error), correlated by id. Issue one via client.lowlevel.query.
+​
+JID
+A WhatsApp address for a user, group, or channel — e.g. 5511999999999@s.whatsapp.net (user), ...@g.us (group), ...@newsletter (channel). See JID helpers.
+​
+LID
+A privacy-preserving identifier (...@lid) that represents a user without exposing their phone number. Prefer it when sending. See Identities.
+​
+MEX
+WhatsApp’s GraphQL-over-IQ layer, used by newsletter and parts of business. The optional argo-codec peer decodes some MEX responses.
+​
+Noise
+The Noise-protocol handshake that authenticates the server and encrypts every frame after connect. See The WhatsApp protocol.
+​
+PN
+“Phone number” — a phone-number JID (...@s.whatsapp.net), as opposed to a LID. See Identities.
+​
+prekey
+A Signal one-time key used to bootstrap an encrypted session with a new peer. Fetched as part of session setup; an envelope that bootstraps a session is a pkmsg.
+​
+ratchet
+The Signal Double Ratchet that encrypts 1:1 messages with forward secrecy. On the wire the envelope is msg (established) or pkmsg (session-initiating).
+​
+sender key
+The group-encryption scheme (skmsg): each member distributes a sender key once, then encrypts group messages symmetrically under it. See The WhatsApp protocol.
+​
+session
+The Signal protocol state for an encrypted conversation with a peer device, persisted in the store. Refresh one with client.message.syncSignalSession.
+​
+stanza
+A unit of the WhatsApp protocol — a compact binary form of an XMPP-like element. In zapo it’s a BinaryNode.
+​
+store
+The pluggable persistence layer that holds auth, Signal state, app-state, and optionally messages/threads/contacts. Built with createStore. See Stores.
+​
+view-once
+Media that the recipient can open only once. Send it with the viewOnce option. See Media.
+​
+write-behind
+Batched, asynchronous persistence of incoming messages/threads/contacts so the hot path isn’t blocked on the database. Tuned via the writeBehind option.
+
+The WhatsApp protocol
+
+A tour of the WhatsApp multi-device protocol — Noise transport, XML stanzas, Signal encryption, and how zapo implements each layer in TypeScript.
+
+zapo is an independent, from-scratch implementation of the WhatsApp multi-device protocol. This page explains what the protocol looks like on the wire and points at the modules where zapo handles each layer. You don’t need any of it to use the library — it’s here for the curious and for contributors.
+The protocol-definition artifacts under spec/ (protobuf, app-state, and MEX schemas) are generated from the open vinikjkkj/wa-spec repository, which tracks the WhatsApp protocol definitions.
+​
+The layers
+From the socket up:
+
+
+
+Your code
+
+Coordinators
+
+Message pipeline
+
+Signal / sender-key encryption
+
+Binary node codec
+
+Noise · encrypted
+
+WebSocket web / TCP mobile
+
+WhatsApp servers
+
+​
+Transport & the Noise handshake
+WhatsApp doesn’t speak plain WebSocket — every byte after connect is wrapped in a Noise protocol session (an XX-style handshake using Curve25519, AES-GCM, and SHA-256). The handshake authenticates the server, negotiates session keys, and from then on every frame is AES-GCM encrypted with a counter nonce.
+In zapo:
+src/transport/WaComms.ts owns the socket + Noise lifecycle.
+src/transport/noise/ implements the handshake state machine (WaNoiseHandshake), the encrypted socket wrapper, and the login/registration client payload (device metadata, app version, locale).
+The socket itself is pluggable: src/transport/WaWebSocket.ts for the browser/Node WebSocket (companion mode), src/transport/node/WaMobileTcpSocket.ts for the raw TCP transport (mobile mode).
+​
+Stanzas: the binary node codec
+Inside the Noise tunnel, WhatsApp speaks a compact binary form of XMPP-like stanzas. zapo models every stanza as a BinaryNode:
+interface BinaryNode {
+  tag: string
+  attrs: Record<string, string>
+  content?: Uint8Array | string | readonly BinaryNode[]
+}
+The wire format uses a token dictionary (common strings like s.whatsapp.net are single bytes), nibble/hex packing for JIDs and numbers, and optional compression. zapo’s codec lives in src/transport/binary/ (encoder.ts, decoder.ts, tokens.ts) and is written for zero-copy — the decoder returns subarray views over the received bytes instead of copying.
+​
+Requests & responses (IQ)
+Many operations are request/response IQ stanzas (<iq type="get|set"> → <iq type="result|error">), correlated by a stanza id. src/transport/node/WaNodeOrchestrator.ts assigns ids, tracks in-flight queries in a map, and resolves the matching response (or times out). The typed coordinators are built on top of this; you can reach it directly via client.lowlevel.query.
+​
+End-to-end encryption (Signal)
+Message bodies are end-to-end encrypted with the Signal protocol. zapo implements it in src/signal/ on top of the primitives in src/crypto/:
+Identity & prekeys — each device has a long-term identity key and a set of one-time prekeys. Establishing a session with a new peer fetches their prekey bundle.
+1:1 chats — a Double-Ratchet session encrypts each message. On the wire the envelope is msg (an established session) or pkmsg (a prekey message that also bootstraps the session).
+Groups — a sender-key scheme (skmsg): each member distributes a sender key once, then encrypts group messages symmetrically (AES-CBC) under it. Distribution messages ride along to members who don’t have your sender key yet.
+The envelope discriminator ('msg' | 'pkmsg' | 'skmsg') appears throughout as the encrypted message type.
+​
+Multi-device & fanout
+WhatsApp is multi-device: an account is a set of devices, and a message must be encrypted once per recipient device. zapo resolves the device list for each recipient, establishes Signal sessions as needed, and fans the ciphertext out into a single <message> stanza. Recipients are addressed either by phone-number JID or by LID, the addressing_mode chosen from group membership. Your own other devices receive a deviceSentMessage copy so all your devices stay in sync.
+​
+App-state sync
+Settings that must look the same on every device — mute, pin, archive, read state, labels, contacts — are not messages. They sync through a separate app-state channel: encrypted, MAC’d mutations layered into collections, reconciled with an LT-hash so devices converge. zapo implements this in src/appstate/ (WaAppStateSyncClient + WaAppStateCrypto) and surfaces it through client.chat and the mutation event.
+​
+Media
+Media isn’t sent inline. The bytes are encrypted with a per-message media key (AES-CBC + HMAC) and uploaded to a WhatsApp CDN; the stanza carries the URL, keys, and digests. The recipient downloads and decrypts. zapo handles upload/download in src/media/ — see the media guide.
+​
+MEX (GraphQL)
+Newer surfaces — newsletters, parts of business, some notifications — use MEX, a GraphQL-over-IQ layer. zapo wraps these queries in the relevant coordinators (e.g. client.newsletter); the optional argo-codec peer decodes certain MEX responses.
+​
+Design choices
+zapo makes deliberate, protocol-informed choices:
+index-first — behavior is validated against WhatsApp Web before it’s implemented.
+performance-first — Uint8Array everywhere, zero-copy in hot paths, bounded in-memory structures. Crypto is synchronous except elliptic-curve operations (which are async) — see internals.
+async-first I/O — network and I/O are async; the hot decode/encode paths avoid needless allocation.
+For how these layers are wired into the client, see Architecture in depth.
