@@ -6002,3 +6002,332 @@ Bounded in-memory structures to prevent unbounded growth.
 Named exports only; no default exports.
 No enums — constants use Object.freeze({ … } as const), surfaced as the WA_* objects.
 Path aliases (@client, @crypto, @store, …) instead of relative ../ imports.
+
+Mobile connections
+
+Connect zapo as a primary mobile (Android) WhatsApp client over the TCP transport instead of a companion device, including the limitations involved.
+
+Besides the standard companion mode (linking via QR / pairing code, like WhatsApp Web), zapo can connect as a primary mobile client — speaking the Android app’s protocol over a raw TCP socket.
+Mobile support is stable and functional. The one thing zapo does not provide is a registration API — requesting an SMS/voice code, submitting an OTP, or approving a takeover. Registering a number is complex and requires a physical phone, so it’s intentionally out of scope. You connect with an already-registered credential set, and that path is solid.
+​
+How it differs from companion mode
+Companion (default)	Mobile
+Transport	WebSocket (wss://…)	TCP socket (tcp://g.whatsapp.net:443)
+Auth	QR / pairing code	Pre-registered credentials + device fingerprint
+Identity	Linked device	Primary account
+Platform	Browser (chrome, …)	android
+Device info	Not required	Required (hardware fingerprint)
+​
+Enabling mobile mode
+Mobile mode is triggered by the mobileTransport option (a WaMobileTransportOptions). Its presence — or persisted deviceInfo in the loaded credentials — switches the client from the WebSocket transport to the TCP transport.
+const client = new WaClient(
+  {
+    store,
+    sessionId: 'mobile',
+    mobileTransport: {
+      deviceInfo: {
+        manufacturer: 'OnePlus',
+        device: 'OnePlus8Pro',
+        osVersion: '12',
+        osBuildNumber: 'SKQ1.210216.001',
+        appVersion: '2.23.1.1',
+        mcc: '55',  // mobile country code (optional)
+        mnc: '11'   // mobile network code (optional)
+      },
+      passive: false // send keep-alives
+    }
+  },
+  logger
+)
+
+await client.connect()
+​
+WaMobileTransportOptions
+Field	Type	Notes
+deviceInfo	WaMobileTransportDeviceInfo	Required hardware fingerprint (see below).
+tcpUrl	string	Defaults to tcp://g.whatsapp.net:443.
+passive	boolean	false sends keep-alives; true is idle.
+pushName	string	Display name.
+yearClass / memClass	number	Device performance/memory class.
+​
+WaMobileTransportDeviceInfo
+manufacturer, device, osVersion, osBuildNumber, appVersion are required; mcc, mnc, localeLanguageIso6391, localeCountryIso31661Alpha2, phoneId, deviceBoard, deviceModelType, business are optional. A stable fingerprint across runs matters — persist it and reuse the same values.
+Set business: true for a WhatsApp Business account — the login payload then advertises the SMB_ANDROID platform in its userAgent instead of the consumer ANDROID. Without it, Business accounts are rejected with <failure reason='401'> right after the noise handshake, because the login always claimed the consumer platform.
+​
+Credentials
+Mobile mode needs an already-registered credential set: a WaAuthCredentials with meJid populated, platform: 'android', and deviceInfo attached. You seed these into the auth store before connecting (e.g. imported from a device bundle).
+Once credentials with deviceInfo are persisted, later reconnects automatically run in full mobile-primary mode — TCP transport, mobile-style IQ / message id formats, app-state primary gating, and placeholder-resend withholding (see below) all derive from the loaded deviceInfo. You don’t need to re-pass mobileTransport on every construction.
+​
+Placeholder-resend withholding
+When a companion device fails to decrypt an incoming message, it normally asks a paired peer for the original plaintext via a placeholder-resend request. A primary phone has no peer device holding the plaintext, so a mobile-primary session skips the placeholder request entirely and falls back to a plain retry receipt — the standard re-encrypt path the sender already supports. This avoids the request silently timing out and the message being dropped.
+​
+Registration events
+While your mobile session is connected, you’re notified when someone tries to register your number on another device — a security-relevant signal, surfaced as these events:
+client.on('mobile_registration_code', (event) => {
+  // WaRegistrationCodeEvent — someone requested a code to register YOUR number elsewhere
+  console.log('registration code issued:', event.code, 'expires:', event.expiryTimestampMs)
+})
+
+client.on('mobile_account_takeover_notice', (event) => {
+  // WaAccountTakeoverNoticeEvent — another device is taking over your number
+  console.log('takeover attempt from', event.newDevicePlatform, event.newDeviceName)
+})
+Event	Payload	Meaning
+mobile_registration_code	{ code, expiryTimestampMs, fromDeviceId }	Someone requested a registration code to register your number on another phone; the issued code is surfaced here.
+mobile_account_takeover_notice	{ serverToken, attemptTimestampMs, newDeviceName?, newDevicePlatform?, newDeviceAppVersion? }	Another device is claiming (taking over) your number.
+These events are informational — zapo surfaces them but intentionally does not expose methods to submit a code or respond to a takeover. Provisioning a number is done on a real phone; bring the resulting credentials to zapo and connect.
+​
+Email binding
+Mobile-only
+client.email (WaEmailCoordinator) binds and verifies an email address on the account — a recovery/login factor. It is mobile-only: every method throws on a Web/companion connection.
+// Current binding state
+const status = await client.email.getStatus()
+// { email: string | null, verified: boolean, confirmed: boolean }
+
+// Bind an address, request a code, submit it, then confirm
+await client.email.setEmail('me@example.com')
+await client.email.requestVerificationCode({ /* BuildRequestEmailVerificationCodeInput */ })
+const result = await client.email.verifyCode('123456')
+// { verified, autoVerifyFailed, email }
+await client.email.confirm()
+​
+Hosting companion devices
+Mobile-primary only
+A companion session lives on the other side of a QR / pairing code, linked by a real phone. When zapo is the phone, the roles invert: this primary session can host companions — link a WhatsApp Web tab, revoke it, list what’s connected, and reconcile against the server’s device list. The coordinator sits at client.mobile (WaMobileCoordinator).
+client.mobile requires a mobile-primary session. Reading the getter on a Web/companion connection returns the coordinator, but the link/revoke/publish methods throw with client.mobile requires a mobile-primary session (…) before touching the network. reconcileCompanions() becomes a no-op on non-primary sessions.
+​
+Methods
+Method	Signature	Description
+linkCompanion	(qr: string) => Promise<LinkCompanionResult>	Link a companion by scanning its pairing QR string. Returns { deviceJid, keyIndex }.
+linkCompanionByCode	(pairingCode: string) => Promise<LinkCompanionResult>	Link via the 8-character pairing code (the “link with phone number” flow). The companion must have requested a code for this account first; without a pending companion_hello the call throws.
+revokeCompanion	(deviceJid: string, reason?: string) => Promise<void>	Unlink one hosted companion, drop it from the tracked set, and republish the key-index list. reason defaults to 'user_initiated'. Throws when the companion is not tracked by this primary.
+revokeAllCompanions	(reason?: string, { excludeHostedCompanion? }?) => Promise<void>	The phone’s “log out all companion devices” — sends remove-companion-device all="true". With excludeHostedCompanion: true, spares the companions this account itself hosts.
+listCompanions	() => Promise<readonly CompanionRecord[]>	The companions tracked in the current epoch. Each CompanionRecord carries { deviceJid, keyIndex, companionIdentityPublicKey, addedAtSeconds }.
+reconcileCompanions	() => Promise<readonly string[]>	Sync the tracked set against the server’s live device list (usync), dropping any companion the server no longer lists. Runs automatically on connect and on account_sync; safe to call manually. Returns the removed device jids. A no-op when no companions are tracked.
+publishKeyIndexList	() => Promise<void>	Re-sign and republish the key-index list for the current device set (rare — called for you after a link/revoke).
+​
+Events
+Companion-host activity surfaces on the client:
+Event	Payload	When
+companion_host_linked	{ deviceJid: string, keyIndex: number }	A companion successfully linked via linkCompanion / linkCompanionByCode.
+companion_host_revoked	{ deviceJid: string }	A hosted companion was removed — via revokeCompanion / revokeAllCompanions, or dropped during a reconcile after the user unlinked it from another surface.
+companion_host_error	Error	A link or background provisioning step failed.
+​
+Bootstrap gates handled for you
+Every companion a WhatsApp phone links today expects three signals during pair-time. zapo supplies them so the companion doesn’t self-remove after the QR scan:
+LID migration client-props — a LID-native primary declares isChatDbLidMigrated and isSyncdPureLidSession on the <client-props> element so the companion runs setIsLidMigrated at pair time and doesn’t self-remove on its LID-addressed blocklist.
+INITIAL_BOOTSTRAP history-sync — the primary pushes the initial history-sync notification as a peer message; without it the companion self-removes with HistorySyncTimeout.
+Seeded setting_pushName — the primary’s own display name is seeded into the critical_block app-state collection, once per session, so the companion’s critical bootstrap can complete.
+All three are automatic; no method calls required.
+​
+Persistence
+The ADV epoch state (rawId, currentKeyIndex, tracked companions) must persist across restarts — reusing an already-issued companion key index breaks previously linked devices. Wire a CompanionHostPersistence into WaClientOptions.companionHost.persistence and zapo loads/saves it transparently.
+A file-backed implementation ships with the library:
+import { createFileCompanionHostPersistence, WaClient } from 'zapo-js'
+
+const client = new WaClient({
+  store,
+  sessionId: 'primary',
+  mobileTransport: { deviceInfo: /* ... */ },
+  companionHost: {
+    persistence: createFileCompanionHostPersistence('./companion-host.json')
+  }
+}, logger)
+Without a persistence hook the epoch is in-memory only — fine for a smoke test, unsafe for production relinking. On restart the primary would re-issue key index 1 to a new companion while the previously linked companion still holds it, breaking session decryption on the older device.
+​
+Custom backend
+The contract is two methods over CompanionHostEpochState:
+interface CompanionHostPersistence {
+  load(): CompanionHostEpochState | null | Promise<CompanionHostEpochState | null>
+  save(state: CompanionHostEpochState): void | Promise<void>
+}
+
+interface CompanionHostEpochState {
+  readonly rawId: number             // account's stable ADV identity id
+  readonly currentKeyIndex: number   // last-issued key index; next companion gets +1
+  readonly companions: readonly CompanionRecord[]
+}
+
+interface CompanionRecord {
+  readonly deviceJid: string
+  readonly keyIndex: number
+  readonly companionIdentityPublicKey: Uint8Array
+  readonly addedAtSeconds: number
+}
+Point it at whatever store you already run. The state is tiny (an epoch header plus one row per linked companion), so there’s no need for a dedicated core-store domain. Example against better-sqlite3:
+import Database from 'better-sqlite3'
+import type {
+  CompanionHostEpochState,
+  CompanionHostPersistence,
+  CompanionRecord
+} from 'zapo-js'
+
+function createSqliteCompanionHostPersistence(
+  db: Database.Database,
+  sessionId: string
+): CompanionHostPersistence {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS companion_host_epoch (
+      session_id       TEXT PRIMARY KEY,
+      raw_id           INTEGER NOT NULL,
+      current_key_index INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS companion_host_devices (
+      session_id                     TEXT NOT NULL,
+      device_jid                     TEXT NOT NULL,
+      key_index                      INTEGER NOT NULL,
+      companion_identity_public_key  BLOB NOT NULL,
+      added_at_seconds               INTEGER NOT NULL,
+      PRIMARY KEY (session_id, device_jid)
+    );
+  `)
+  const readEpoch = db.prepare<[string]>(
+    'SELECT raw_id AS rawId, current_key_index AS currentKeyIndex FROM companion_host_epoch WHERE session_id = ?'
+  )
+  const readDevices = db.prepare<[string]>(
+    'SELECT device_jid AS deviceJid, key_index AS keyIndex, companion_identity_public_key AS pk, added_at_seconds AS addedAtSeconds FROM companion_host_devices WHERE session_id = ?'
+  )
+  const upsertEpoch = db.prepare(
+    'INSERT INTO companion_host_epoch (session_id, raw_id, current_key_index) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET raw_id = excluded.raw_id, current_key_index = excluded.current_key_index'
+  )
+  const clearDevices = db.prepare('DELETE FROM companion_host_devices WHERE session_id = ?')
+  const insertDevice = db.prepare(
+    'INSERT INTO companion_host_devices (session_id, device_jid, key_index, companion_identity_public_key, added_at_seconds) VALUES (?, ?, ?, ?, ?)'
+  )
+
+  return {
+    load(): CompanionHostEpochState | null {
+      const header = readEpoch.get(sessionId) as { rawId: number; currentKeyIndex: number } | undefined
+      if (!header) return null
+      const rows = readDevices.all(sessionId) as Array<{
+        deviceJid: string
+        keyIndex: number
+        pk: Buffer
+        addedAtSeconds: number
+      }>
+      const companions: CompanionRecord[] = rows.map((row) => ({
+        deviceJid: row.deviceJid,
+        keyIndex: row.keyIndex,
+        companionIdentityPublicKey: new Uint8Array(row.pk),
+        addedAtSeconds: row.addedAtSeconds
+      }))
+      return { rawId: header.rawId, currentKeyIndex: header.currentKeyIndex, companions }
+    },
+    save(state: CompanionHostEpochState): void {
+      db.transaction(() => {
+        upsertEpoch.run(sessionId, state.rawId, state.currentKeyIndex)
+        clearDevices.run(sessionId)
+        for (const c of state.companions) {
+          insertDevice.run(
+            sessionId,
+            c.deviceJid,
+            c.keyIndex,
+            Buffer.from(c.companionIdentityPublicKey),
+            c.addedAtSeconds
+          )
+        }
+      })()
+    }
+  }
+}
+The save runs on every linkCompanion / revokeCompanion / reconcileCompanions state change, so wrap the multi-statement write in a transaction to keep it atomic. load is called once during coordinator wire-up.
+​
+Worked example
+import { WaClient } from 'zapo-js'
+
+const client = new WaClient(
+  { store, sessionId: 'primary', mobileTransport: { deviceInfo } },
+  logger
+)
+
+client.on('companion_host_linked', ({ deviceJid, keyIndex }) => {
+  console.log('linked companion', deviceJid, 'at key index', keyIndex)
+})
+
+client.on('companion_host_revoked', ({ deviceJid }) => {
+  console.log('companion revoked:', deviceJid)
+})
+
+client.on('companion_host_error', (error) => {
+  console.warn('companion-host operation failed', error.message)
+})
+
+await client.connect()
+
+// Prompt for a WhatsApp Web QR string, then link:
+const qr = await readCompanionQrFromSomewhere()
+const { deviceJid } = await client.mobile.linkCompanion(qr)
+
+// Later, list what's connected or revoke:
+const companions = await client.mobile.listCompanions()
+await client.mobile.revokeCompanion(deviceJid)
+​
+Standard features still apply
+Once connected in mobile mode, the rest of the API is unchanged — client.message, client.group, events, stores, etc. all work the same way. The only difference is the transport and the auth/identity model.
+
+Dev tools (MCP & fake server)
+
+Optional dev-only packages: an MCP server to drive a live WaClient from an AI agent, and an in-process fake WhatsApp server for offline integration tests.
+
+zapo ships two optional packages aimed purely at development and testing — neither is meant for production:
+MCP server (@zapo-js/mcp-server) — expose a live WaClient to an AI agent (Claude Code, Cursor) so it can connect, pair, send, and inspect state interactively.
+Fake server (@zapo-js/fake-server) — an in-process fake WhatsApp server used for library-internal benchmarks and cross-check tests. For your own app’s E2E tests, see the End-to-end testing guide.
+​
+MCP server
+Development & testing only. @zapo-js/mcp-server is a debugging aid, not a production protocol server. It exposes a live WaClient — and the whole zapo-js module — to an AI agent that can send messages, read state, and run arbitrary library calls on a real WhatsApp account. Run it only against accounts you control.
+It exposes a live WaClient instance and the zapo-js module namespace as MCP tools. An LLM agent can then drive end-to-end WhatsApp flows — connect, pair, send, query groups/newsletters, inspect events, walk SQL state — without you writing throwaway scripts.
+​
+Tool surface
+Tool	What it does
+call / inspect	Walk dotted paths against client (the WaClient) or lib (the zapo-js namespace, including proto.* and helpers like parsePhoneJid). call invokes functions; inspect lists members.
+events / events_clear	Bounded ring buffer of every WaClientEventMap event — filter by types / since / limit / drain.
+logs / logs_clear	Queryable buffer mirroring every runtime + lib log line (also stderr; JSONL to MCP_LOG_FILE if set).
+lifecycle	status / start / destroy for the client.
+restart	soft (drop the client + clear buffers) or process_exit (also exit so a supervisor respawns it).
+Each tool inlines its own schema and examples — the agent reads them at runtime rather than memorizing flags.
+​
+Install & register
+npm install @zapo-js/mcp-server
+# peers: zapo-js, @zapo-js/store-sqlite, @zapo-js/media-utils (better-sqlite3 optional, for SQLite persistence)
+Register with Claude Code at user scope (build first), so it works from any directory:
+npm run build --workspace @zapo-js/mcp-server
+claude mcp add zapo --scope user -- node <abs-path>/packages/mcp-server/dist/bin.js
+For tight iteration on the library itself, register the source through tsx — no build step, and zapo-js resolves straight from src/:
+claude mcp add zapo --scope user -- node --import tsx <abs-path>/packages/mcp-server/src/bin.ts
+An HTTP transport with node --watch gives the smoothest dev loop: edit a .ts → the process restarts → the next tool call reconnects automatically, with no manual /mcp reconnect. See the package README for the dev script and HTTP setup.
+​
+Pairing gotcha
+client.connect() blocks until pairing finishes, so always start it without awaiting, then poll the event buffer:
+call({ path: 'connect', noAwait: true })
+events({ types: ['auth_qr', 'auth_pairing_code', 'auth_paired', 'connection'] })
+Surface the auth_qr string to the user, wait for auth_paired, then continue.
+​
+Key environment variables
+Var	Default	Purpose
+MCP_AUTH_PATH	<cwd>/.auth/state.sqlite	SQLite credential store path
+MCP_SESSION_ID	default_2	sessionId passed to WaClient
+MCP_LOG_LEVEL	info	trace / debug / info / warn / error
+MCP_TRANSPORT	stdio	stdio or http
+MCP_HTTP_HOST / MCP_HTTP_PORT / MCP_HTTP_PATH	127.0.0.1 / 3737 / /mcp	HTTP listener config
+MCP_EVENT_BUFFER_SIZE / MCP_LOG_BUFFER_SIZE	1000 / 500	In-memory ring sizes
+One WaClient per process (multi-session needs multiple servers with distinct MCP_AUTH_PATH + MCP_SESSION_ID); no auto-reconnect (call connect again on connection: close); restart soft does not pick up code changes while process_exit + a supervisor does. Full reference: packages/mcp-server/README.md.
+​
+Fake server
+@zapo-js/fake-server is the in-process fake WhatsApp Web server the library uses for cross-check tests and benchmarks. It’s also the recommended way to run end-to-end tests for your own app without touching WhatsApp — see the dedicated End-to-end testing guide, which covers install, programmatic API, FakePeer fixtures, multi-session isolation, and CI recipes.
+The rest of this section is scoped to the library-internal use — benchmarking.
+​
+Benchmarking
+The package ships a messaging profiler (send/recv × 1:1/group) used to track the library’s performance, plus focused scenario suites for connect lifecycle, history sync, bulk usync, group provisioning, media upload, receipts flood, reconnect/resume, app-state, media-on-the-wire, and the Signal retry round-trip:
+npm --workspace=@zapo-js/fake-server run bench:messaging
+# or one of: bench:connect, bench:history, bench:usync, bench:group,
+#           bench:media, bench:media:messaging, bench:receipts,
+#           bench:reconnect, bench:appstate, bench:retry
+bench:media:messaging sweeps every media type (image / video / audio / ptt / document / sticker) across 1:1 send, group fan-out (SKDM + SKMSG), and receive + download. It defaults to streaming input (Readable.from(...)) so the lib walks its streaming-upload path; switch to in-memory mode with ZAPO_BENCH_MEDIA_INPUT=buffer to A/B.
+bench:retry validates the full retry round-trip against wa-web’s reference parser: incoming retry, recovery, and outbound retry replay after the peer rotates its prekey bundle.
+Tune the workload with ZAPO_BENCH_* env vars (ZAPO_BENCH_CONTACTS, ZAPO_BENCH_GROUP_MEMBERS, ZAPO_BENCH_MESSAGES, ZAPO_BENCH_SCENARIOS, …) and add --cpu / --heap / --separate-process for profiles. With --separate-process, the bench drives the fake server in a child process over an RPC bridge and emits a matching server-side CPU profile and heap snapshot alongside the lib-side ones.
+Pick a store backend with ZAPO_BENCH_STORE (memory, sqlite, postgres, mysql, redis, or mongo) — the same ZAPO_TEST_* connection env vars as the cross-store test harness apply. To sweep every bench across multiple stores in one shot:
+npm --workspace=@zapo-js/fake-server run bench:all-stores -- \
+  --stores=memory,sqlite --benches=connect-lifecycle,history-sync
+Add --start-docker to bring up the bundled Postgres/MySQL/Redis/Mongo services on ephemeral ports and tear them down at the end. See packages/fake-server/README.md for the full flag reference.
+bench:all-stores only sweeps the eight scenario suites (connect-lifecycle, history-sync, bulk-usync, group-provision, media-upload, receipts-flood, reconnect-resume, appstate) plus messaging. The newer bench:media:messaging and bench:retry aren’t in its --benches= set yet; run them directly when you need them.
+The fake server is an in-process testing harness, not a runtime you deploy. Pair it with the memory store for fast, isolated tests that reset on every run.
