@@ -5864,3 +5864,141 @@ index-first — behavior is validated against WhatsApp Web before it’s impleme
 performance-first — Uint8Array everywhere, zero-copy in hot paths, bounded in-memory structures. Crypto is synchronous except elliptic-curve operations (which are async) — see internals.
 async-first I/O — network and I/O are async; the hot decode/encode paths avoid needless allocation.
 For how these layers are wired into the client, see Architecture in depth.
+
+Architecture in depth
+
+How zapo handles Noise handshakes, Signal sessions, prekey rotation, sender keys, app-state mutations, and the write-behind store internally.
+
+This page goes deeper than the architecture overview — into the subsystems and data flows inside zapo. It’s aimed at contributors and anyone debugging at the protocol level. For the protocol itself, see The WhatsApp protocol.
+​
+Module map
+src
+client
+transport
+signal
+crypto
+message
+appstate
+store
+auth
+media
+retry
+protocol
+infra
+util
+Directory	Responsibility
+src/client/	Client orchestration, coordinators, connection lifecycle, event routing.
+src/transport/	Socket, Noise handshake, binary node codec, node orchestration.
+src/signal/	Signal sessions, ratchet (1:1), sender keys (groups), key generation.
+src/crypto/	Primitives: AES-GCM/CBC/CTR, SHA, HMAC, HKDF, Curve25519/Ed25519.
+src/message/	Outgoing build/encode + incoming parse/decrypt pipeline.
+src/appstate/	App-state sync engine (mutations, snapshots, crypto, MACs).
+src/store/	Store contracts + memory providers; persistence boundary.
+src/auth/	Pairing/QR/credential flows.
+src/media/	Media upload/download/encryption.
+src/retry/	Retry tracking for failed sends/decryptions.
+src/protocol/	Constants (node tags, IQ types, xmlns) and JID helpers.
+src/infra/	Logging, bounded collections, locks, perf utilities.
+src/util/	Byte/async/primitive helpers.
+​
+The stack
+
+
+WaClient · thin EventEmitter · coordinator getters
+
+WaMessageDispatchCoordinator
+build · encrypt · fanout · ack/retry
+
+Signal · SignalProtocol / SenderKeyManager
+msg · pkmsg · skmsg
+
+WaNodeOrchestrator · IQ id matching
+
+WaNodeTransport · BinaryNode to wire frame
+
+Binary codec · encoder / decoder / tokens
+
+WaComms + Noise · encrypted frames
+
+WaWebSocket / WaMobileTcpSocket
+
+Stores cut across every layer; the connection manager and keep-alive sit beside the transport.
+​
+Connection lifecycle
+WaConnectionManager (in src/client/connection/) drives connect/disconnect:
+WaComms opens the socket (WaWebSocket or WaMobileTcpSocket) and runs the Noise handshake (src/transport/noise/), authenticating the server and deriving session keys.
+WaNodeTransport.bindComms() attaches the binary codec to the encrypted socket.
+WaKeepAlive (src/transport/keepalive/) starts periodic ping IQs to detect a dead socket and estimate server clock skew.
+The client runs post-connect passive tasks (history sync, offline-message drain) and emits connection.
+zapo deliberately does not auto-reconnect — that policy belongs to your app (see Reconnection).
+​
+Outgoing message pipeline
+
+WhatsApp
+NodeOrchestrator
+Signal
+MessageDispatch
+Your code
+WhatsApp
+NodeOrchestrator
+Signal
+MessageDispatch
+Your code
+message.send(to, content)
+build Proto.IMessage · upload media
+encrypt per recipient device
+msg / pkmsg / skmsg
+send message stanza
+encrypted frame
+ack
+WaMessagePublishResult
+client.message.send → WaMessageDispatchCoordinator:
+Build — content (the send union) is built into a Proto.IMessage, uploading media if needed.
+Resolve devices — the recipient’s device list is resolved (fanout, src/client/messaging/), fetching prekey bundles for devices without a session.
+Encrypt — per device: 1:1 via the Signal ratchet (SignalProtocol → msg/pkmsg), groups via SenderKeyManager (skmsg) plus sender-key distribution to members who need it. Your own devices get a deviceSentMessage.
+Assemble — src/transport/node/builders/message.ts wraps the encrypted participants into one <message> stanza with the device identity, participant hash, and addressing_mode (pn/lid).
+Send & ack — WaNodeOrchestrator.sendNode() encodes and writes it; the coordinator waits for the server <ack> and returns a WaMessagePublishResult. Failures are retried per the configured attempts/backoff.
+​
+Incoming pipeline
+WaComms decrypts a Noise frame; WaNodeTransport.dispatchIncomingFrame() decodes it into a BinaryNode.
+WaIncomingNodeCoordinator routes by tag/type to the right handler (src/client/events/).
+For messages, the body is decrypted (Signal ratchet or sender key), device-sent wrappers are unwrapped, and PKCS7 padding removed (src/message/primitives/incoming.ts).
+The result is normalized into a typed payload and emitted (message, receipt, group, …). A stanza filter can drop stanzas before handlers run; the coordinator still acks message/receipt/notification so the server stops re-delivering.
+Decryption failures are tracked and can trigger a retry-receipt so the sender re-encrypts.
+​
+App-state engine
+WaAppStateSyncClient (src/appstate/) reconciles per-account settings:
+A sync sends the last known version per collection; the server returns patches (or a full snapshot).
+Each mutation’s index and value are MAC-verified and the value decrypted (WaAppStateCrypto: AES-CBC + HMAC, per-collection keys derived via HKDF).
+Verified mutations are applied to the appState store and surfaced as mutation events.
+Contact sink — winning Contact mutations (including the snapshot ones at pair-time) stream into the contacts store unconditionally, bootstrapping the address book on first connect independent of the public emitSnapshotMutations toggle. The sink resolves the LID-canonical JID from contactAction.lidJid, mirrors the PN form into phoneNumber, and writes fullName ?? firstName as displayName. History-sync additionally persists inlineContacts and per-conversation displayName / username when the primary device forwards them; the pair payload advertises supportInlineContacts so the server knows to ship those.
+Outgoing changes from client.chat are encoded as mutations, batched, and flushed.
+​
+Store layer
+The store is split into contracts (src/store/contracts/ — the interface each domain implements) and providers (the built-in memory provider, plus the external backend packages). This is what lets you mix backends per domain in createStore.
+Two performance boundaries sit here:
+Write-behind — incoming messages/threads/contacts are batched and flushed asynchronously (tuned via writeBehind) so the hot path isn’t blocked on the database.
+Bounded caches — retry, groupMetadata, deviceList, and messageSecret are bounded in-memory with TTLs to prevent unbounded growth in long-lived processes.
+​
+Reliability
+Retry tracker (src/retry/) — maps failed message ids to retry metadata and enforces attempt/backoff limits.
+Receipt queue (WaReceiptQueue) — buffers receipts that fail to send during a disconnect, replaying them on reconnect (bounded to avoid growth).
+Keep-alive — periodic ping IQs detect dead sockets and measure clock skew; it skips pinging while a query is already in flight.
+​
+Client composition
+WaClientFactory is the composition root: it constructs the auth client, connection manager, transport + orchestrator, keep-alive, Signal/sender-key managers, app-state client, stores, and every feature coordinator, then injects them into WaClient. WaClient itself stays thin — an EventEmitter exposing coordinator getters and the connection lifecycle.
+​
+Crypto
+src/crypto/ provides the primitives:
+Symmetric — AES-GCM (Noise, app-state values), AES-CBC (sender keys), AES-CTR (media).
+Hash/MAC/KDF — SHA-1/256/512, HMAC, HKDF.
+Elliptic curve — Curve25519 (X25519 DH) and Ed25519/XEdDSA signatures.
+Everything here is synchronous except the elliptic-curve operations, which are async. Keeping the rest of crypto synchronous removed per-call async overhead and measurably improved throughput on the hot paths; the curve operations stay async by design.
+​
+Conventions
+These hold across the codebase and explain much of the API shape:
+Uint8Array everywhere for binary data; Buffer is avoided. Zero-copy (subarray, byte views) in critical paths.
+Bounded in-memory structures to prevent unbounded growth.
+Named exports only; no default exports.
+No enums — constants use Object.freeze({ … } as const), surfaced as the WA_* objects.
+Path aliases (@client, @crypto, @store, …) instead of relative ../ imports.
