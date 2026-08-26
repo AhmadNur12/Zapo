@@ -1528,3 +1528,156 @@ const badPlugin = defineWaClientPlugin({
   setup: () => ({})
 })
 ​
+Events
+
+Reference for every WaClient event you can subscribe to: messages, receipts, groups, history sync, app-state mutations, and failures.
+
+WaClient is a strongly-typed event emitter. Every incoming activity — messages, receipts, group changes, presence — is surfaced as an event with a typed payload.
+Plugins can contribute their own typed events; they appear on client.on only when the plugin is in the plugins array. See the VoIP guide for an example — its voip_* events are available when voipPlugin() is installed.
+​
+Listening
+import type { WaIncomingMessageEvent } from 'zapo-js'
+
+client.on('message', (event: WaIncomingMessageEvent) => {
+  console.log(event.key.remoteJid, event.message)
+})
+
+client.once('auth_paired', ({ credentials }) => {
+  console.log('paired', credentials.meJid)
+})
+
+const handler = (e) => { /* ... */ }
+client.on('receipt', handler)
+client.off('receipt', handler) // stop listening
+on, once, and off are all type-checked against the event map — the payload type is inferred from the event name, so listeners get full autocomplete.
+​
+Auth & connection
+Event	Payload	Description
+auth_qr	{ qr, ttlMs }	A QR code to render for pairing.
+auth_pairing_code	{ code }	An 8-character pairing code was issued.
+auth_pairing_required	{ forceManual }	The session needs pairing input.
+auth_passkey_required	{ hasSigner }	The server is forcing a Shortcake passkey to link. hasSigner: false means the handshake stalls until you configure a signer.
+auth_paired	{ credentials }	Pairing succeeded.
+connection	WaConnectionEvent	Socket opened or closed (see below).
+The connection event is a discriminated union on status:
+client.on('connection', (event) => {
+  if (event.status === 'open') {
+    console.log('online; new login?', event.isNewLogin)
+  } else {
+    console.log('closed:', event.reason, 'logout?', event.isLogout)
+  }
+})
+See Reconnection for the handling pattern.
+​
+Messages
+Event	Payload	Description
+message	WaIncomingMessageEvent	An inbound <message> stanza was decrypted.
+message_send	WaOutgoingMessageEvent	An outbound message this client is sending, with its decrypted Proto.IMessage — the symmetric counterpart to message. Lets plugins / loggers observe forwards, reactions, polls, media the wire stanza hides.
+message_addon	WaIncomingAddonEvent	Reactions, poll votes, comments (decrypted addons).
+message_protocol	WaIncomingProtocolMessageEvent	Protocol messages (edits, revokes, …).
+message_bot_chunk	WaIncomingBotChunkEvent	Streamed bot response chunks.
+message_unavailable	WaIncomingUnavailableMessageEvent	A content-less placeholder arrived (see Unavailable messages).
+receipt	WaIncomingReceiptEvent	Delivery / read / played receipts.
+See Receiving messages for payload details and text extraction.
+​
+Unavailable messages
+Some incoming <message> stanzas carry an <unavailable/> marker instead of an encrypted body — a view-once whose contents have already been consumed, a hosted/bot message the server could not fan out, or a plain fanout placeholder the primary device can still resend. There is nothing to decrypt on the stanza itself, but the arrival is useful information (audit logs, a “this message is no longer available” UI row, or waiting for the resend to land). The lib acks them and emits a typed message_unavailable event with a kind discriminator:
+client.on('message_unavailable', (event) => {
+  // event.kind: 'view_once' | 'hosted' | 'bot' | 'other'
+  console.log('unavailable', event.kind, 'resendRequested?', event.resendRequested,
+    'from', event.key.remoteJid, 'id', event.key.id)
+})
+Field	Type	Notes
+kind	'view_once' | 'hosted' | 'bot' | 'other'	Which flavor the server signalled. 'other' is a plain fanout placeholder — the only recoverable kind.
+resendRequested	boolean	true when the lib queued a PLACEHOLDER_MESSAGE_RESEND peer request; the payload then arrives later as a message event with the same key.id. false for the unrecoverable kinds, messages past the AB-props age window, and mobile-primary sessions.
+key	WaIncomingMessageKey	Same shape the message event carries — store or correlate it like any other message id.
+timestampSeconds	number?	From the stanza’s t attr.
+pushName	string?	Sender’s display name from the stanza’s notify attr.
+Resend requests are best-effort — like wa-web, they are not persisted, so a failed peer request is not retried. See Receiving messages → Recovering unavailable messages for the details.
+​
+Presence & chat-state
+Event	Payload	Description
+presence	WaIncomingPresenceEvent	A contact’s presence changed (available / last-seen).
+chatstate	WaIncomingChatstateEvent	Typing / recording / paused.
+call	WaIncomingCallEvent	Incoming call signaling.
+​
+Groups, newsletters & profiles
+Event	Payload	Description
+group	WaGroupEvent	Group create/subject/participant/setting changes.
+newsletter	WaIncomingNewsletterEvent	Newsletter activity.
+newsletter_message_update	WaIncomingNewsletterMessageUpdateEvent	Edits/reactions/poll updates on newsletter messages.
+business	WaBusinessEvent	Business profile changes.
+picture	WaPictureEvent	Profile/group picture changes.
+privacy	WaPrivacyAccountSyncResult	The account’s privacy was changed on the primary or another companion — the full category set plus any disallowed list the server reported. Debounced 1s, so a burst of changes on the phone collapses into one refresh. Values always come from a fresh read, never from the notification payload.
+blocklist	WaBlocklistResult	The account blocklist after a block/unblock made on another device. Same refetch path as privacy; the payload is the full list, never a delta.
+own_username	WaOwnUsernameNotificationEvent	The account’s username was set / deleted / modified on the primary or another companion. kind discriminates the change; username is populated only for kind: 'set'.
+​
+State, history & MEX
+Event	Payload	Description
+mutation	WaAppStateMutationEvent	App-state mutation (mute, pin, archive, …) synced from another device. Inbound only; this client’s own outbound actions surface on mutation_send.
+mutation_send	WaAppStateMutationEvent	An app-state action this client is sending — the outbound counterpart to mutation, symmetric to how message_send pairs with message. event.source is always 'local'. Optimistic: emitted as the mutation is enqueued, before the server flush confirms it.
+history_sync_chunk	WaHistorySyncChunkEvent	A chunk of synced message history (initial bootstrap or message.requestHistorySync backfill). Skipped only when history.enabled is explicitly false. Ingestion is streamed — the proto reader descends into conversations one message at a time, so ingest peak memory stays flat regardless of chunk size. messagesCount counts written records, not read ones; a chunk whose bounded park of messages waiting on Conversation.id overflows fails and stays unacked (the primary resends), rather than completing with silent drops.
+group_history_bundle	WaGroupHistoryBundleEvent	A group-history bundle another member shared with this account after it joined a group, already downloaded, filtered and persisted. Requires history.groupBundles: true — the fetch is opt-in because a third party triggers it. See Groups → receiving.
+offline_resume	WaOfflineResumeEvent	Progress of the post-connect offline-message drain.
+offline_thread_metadata	WaOfflineThreadMetadataEvent	Preview manifest of the offline queue (per-thread latest-stanza timestamps, optional per-thread read watermarks, optional pending status / notification backlog counts). Sent just before the flush; not guaranteed to arrive. Use offline_resume for progress, never this.
+mex_notification	WaMexNotificationEvent	MEX (GraphQL) notifications: username, status, LID changes, capping.
+​
+MEX notification kinds
+WaMexNotificationEvent is a discriminated union on kind. Every variant carries operationName (the upstream GraphQL operation) and errors: readonly WaMexNotificationGraphQlError[] (any GraphQL errors the server attached — typically empty).
+kind	operationName	Extra fields
+username_set	UsernameSetNotification	lidJid, username — a contact set or changed their username.
+username_delete	UsernameDeleteNotification	lidJid, displayName: string | null — username cleared (null means the server omitted the fallback name).
+username_update_hint	UsernameUpdateNotification	contactHash — side-channel hint that something changed for a contact bucket; refetch through the regular profile path.
+own_username_sync	AccountSyncUsernameNotification	ownLidJid, username | null, state | null, pin | null — your own username state synced from another device. null username means it was removed.
+text_status_update	TextStatusUpdateNotification	jid, text | null, emoji | null, ephemeralDurationSec | null, lastUpdateTime | null — a contact’s about/status changed. null text/emoji clears that field.
+text_status_update_hint	TextStatusUpdateNotificationSideSub	contactHash — side-channel hint; refetch the status.
+lid_change	LidChangeNotification	oldLidJid, newLidJid — a user’s LID rotated. See LID changes.
+message_capping	MessageCappingInfoNotification	cappingStatus ('NONE' | 'FIRST_WARNING' | 'SECOND_WARNING' | 'CAPPED' | string), plus optional oteStatus, mvStatus, totalQuota, usedQuota, cycleStartTimestamp, cycleEndTimestamp, serverSentTimestamp — your account’s outgoing-message quota state.
+unknown	(whatever the server sent)	data: unknown — catch-all for an operationName without a typed variant; the raw GraphQL data payload is passed through verbatim so you can decode it yourself.
+client.on('mex_notification', (event) => {
+  switch (event.kind) {
+    case 'username_set':
+      console.log(`${event.lidJid} now goes by @${event.username}`)
+      break
+    case 'text_status_update':
+      console.log(`${event.jid} status:`, event.text, event.emoji)
+      break
+    case 'message_capping':
+      console.log(`capping ${event.cappingStatus}:`, event.usedQuota, '/', event.totalQuota)
+      break
+    case 'lid_change':
+      console.log('LID rotated:', event.oldLidJid, '→', event.newLidJid)
+      break
+  }
+})
+*_hint kinds (username_update_hint, text_status_update_hint) carry only a contactHash, not the new value — the server is telling you “something changed for this bucket” and the client is expected to refetch through the regular profile / status fetch path.
+​
+Companion host (mobile-primary)
+Emitted by the client.mobile coordinator when a mobile-primary session links, revokes, or fails to provision a companion device. All three only fire on a mobile-primary session.
+Event	Payload	Description
+companion_host_linked	{ deviceJid: string, keyIndex: number }	A companion successfully linked via linkCompanion / linkCompanionByCode.
+companion_host_revoked	{ deviceJid: string }	A hosted companion was removed — via revokeCompanion / revokeAllCompanions, or dropped during a reconcileCompanions() sweep after the user unlinked it from another surface.
+companion_host_error	Error	A link or background provisioning step failed.
+​
+Failures
+Event	Payload	Description
+stream_failure	WaIncomingFailureEvent	A stream-level failure (may precede a disconnect).
+stanza_error	WaIncomingErrorStanzaEvent	An error stanza from the server.
+​
+Debug events
+A family of debug_* events expose low-level internals — raw frames, decoded nodes, decode errors, unhandled stanzas, and client errors. They are useful for protocol debugging but noisy; subscribe selectively.
+client.on('debug_transport_node_in', ({ node }) => console.dir(node, { depth: null }))
+client.on('debug_client_error', ({ error }) => console.error(error))
+​
+debug_decrypted_payload
+The plaintext of every decrypted <enc> in the stanza, emitted between the unpad and the proto.Message.decode step. Fires whether or not decoding then succeeds — which is what makes the failing case observable at all. Without this hook, a payload that decrypts but does not decode (a proto field the library does not yet know about, a malformed body) is otherwise lost: decode throws, the stanza is reported through debug_unhandled_stanza, and the bytes go with it — while the decryption has already advanced the ratchet, so the same ciphertext will never decrypt again.
+Field	Type	Notes
+encIndex	number	Which <enc> of the stanza produced these bytes, counting from zero. A message addressed to several devices carries several <enc> nodes whose ciphertexts are unrelated — attributing a payload to the wrong index attributes it to the wrong sender.
+encType	string	The <enc> node’s type attribute: msg, pkmsg, skmsg, …
+plaintext	Uint8Array	The unpadded plaintext. A copy, so mutating it cannot alter the message the library then delivers.
+client.on('debug_decrypted_payload', ({ encIndex, encType, plaintext }) => {
+  fs.appendFileSync('payloads.bin', plaintext)
+  console.log('captured', encType, 'idx', encIndex, plaintext.length, 'bytes')
+})
+Costs nothing when nobody is subscribed — the plaintext copy is only built when at least one listener is attached. Useful for recording traffic for faithful replay (re-encoding a decoded message does not reproduce the original bytes), or decoding with a newer protobuf than the library carries. A listener that throws is swallowed and logged, so a buggy observer cannot poison delivery.
+Mobile-registration events (mobile_registration_code, mobile_account_takeover_notice) exist for the mobile-registration path and are not part of the standard companion flow.
