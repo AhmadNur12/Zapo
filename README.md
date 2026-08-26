@@ -725,3 +725,658 @@ ShareOwnPn	Whether your own phone number is shared in a given context.
 Signal sessions
 Signal sessions are keyed by the canonical JID (PN or LID) plus device id. zapo canonicalizes hosted server variants (hosted.lid → lid, hosted → s.whatsapp.net) before lookups, and maintains sessions for both addressing forms. If you ever need to force a fresh session sync for a peer, use:
 await client.message.syncSignalSession(jid)
+
+Configuration
+
+Configure WaClient: sessions, timeouts, history sync, presence on connect, addons, proxy, logging, logout cleanup, and production knobs.
+
+WaClient takes a WaClientOptions object and an optional logger:
+const client = new WaClient(options, logger)
+Only store and sessionId are required; everything else has a sensible default.
+​
+Required options
+​
+store
+WaStorerequired
+The store instance built by createStore. Holds every per-session domain (auth, signal, app-state, …).
+​
+sessionId
+stringrequired
+Logical session identifier — it keys every domain inside store. Use a stable string per device/account. Changing it between runs orphans the previous credentials and forces re-pairing.
+​
+Sessions and multi-tenancy
+Every store domain is keyed by sessionId, so a single store can hold many independent accounts. To run several accounts in one process, create one WaClient per sessionId over the same store:
+const store = createStore({ /* ... */ })
+
+const accountA = new WaClient({ store, sessionId: 'account-a' }, logger)
+const accountB = new WaClient({ store, sessionId: 'account-b' }, logger)
+
+await Promise.all([accountA.connect(), accountB.connect()])
+Each client pairs and reconnects independently. For the full picture — what’s per-session vs shared, the single-writer rule across processes, memory budget, sharding, and shutdown — see Multi-session deployments.
+​
+Device fingerprint
+These control how the device appears under Linked devices on the phone:
+​
+deviceBrowser
+stringdefault:"'chrome'"
+Browser id advertised during pairing ('chrome', 'firefox', 'safari', …; see WA_BROWSERS). Drives the Linked Devices label.
+​
+devicePlatform
+string
+Numeric companion platform id override (WA_COMPANION_PLATFORM_IDS). Inferred from deviceBrowser when omitted; set explicitly for non-browser platforms.
+​
+deviceOsDisplayName
+string
+Human-readable OS name shown under Linked devices ('Windows', 'Mac OS', 'Linux', …). Defaults to the current runtime’s OS.
+​
+deviceOsVersion
+string
+OS version advertised in DeviceProps.version ('10', '14.6', …). Defaults to the detected runtime OS version. Set this alongside deviceOsDisplayName when advertising an OS the process is not running on, so the name and version stay a matching pair. Values that are not dotted-numeric leave the field unset — matching how WhatsApp Web itself behaves.
+new WaClient({
+  store,
+  sessionId: 'default',
+  deviceBrowser: 'Chrome',
+  deviceOsDisplayName: 'Mac OS',
+  deviceOsVersion: '14.6'
+}, logger)
+For the MCP server the same overrides are available as MCP_DEVICE_OS_DISPLAY / MCP_DEVICE_OS_VERSION environment variables — when only the version is set the display name is still derived from the host, so pin both to keep the advertised pair consistent.
+
+
+History sync
+​
+history
+WaHistorySyncOptions
+Controls processing of historySyncNotification chunks — both the initial bootstrap WhatsApp pushes after pairing and the on-demand backfill triggered by message.requestHistorySync.
+enabled?: boolean — process incoming history chunks. Default true. Set to false to drop them silently (useful when you don’t persist mailbox/threads/contacts and the conversation download would just burn bandwidth). The lib still acks the chunk so the server stops re-sending it, matching wa-web.
+requireFullSync?: boolean — request the full archive instead of just recent chats.
+groupBundles?: boolean — opt into downloading the group-history bundle a member may share after somebody joins a group; emits group_history_bundle. Off by default — a bundle is media a third party pushes at this account unprompted, so fetching it is opt-in. Bundles addressed to other members are dropped either way. See Groups → sharing group history.
+Chunks are decrypted, inflated, and parsed incrementally — one message is alive at a time as the proto stream descends into conversations, so a large chat that would materialize into hundreds of MB of JS objects stays flat. Group history bundles get the same treatment. There is no consumer-facing knob; peak memory during ingest just stopped tracking chunk size.
+new WaClient({
+  store,
+  sessionId: 'default',
+  history: { enabled: true, requireFullSync: true }
+}, logger)
+History arrives as history_sync_chunk events.
+​
+Timeouts
+All in milliseconds; defaults are tuned for production.
+Option	Purpose
+iqTimeoutMs	Default timeout for IQ queries (default 60s).
+nodeQueryTimeoutMs	Default timeout for raw node query() calls.
+keepAliveIntervalMs	Interval between keep-alive ping IQs.
+deadSocketTimeoutMs	How long without a reply before the socket is considered dead.
+mediaTimeoutMs	Media upload/download timeout.
+appStateSyncTimeoutMs	App-state sync round timeout.
+messageAckTimeoutMs	How long message.send waits for the server <ack> per attempt.
+messageMaxAttempts	Max attempts for a single message.send.
+messageRetryDelayMs	Delay between message-send retries.
+signalFetchKeyBundlesTimeoutMs	Timeout for Signal prekey-bundle fetches.
+
+Search...
+
+
+Navigation
+Core concepts
+Configuration
+Core concepts
+Configuration
+
+Copy page
+
+Configure WaClient: sessions, timeouts, history sync, presence on connect, addons, proxy, logging, logout cleanup, and production knobs.
+
+WaClient takes a WaClientOptions object and an optional logger:
+const client = new WaClient(options, logger)
+Only store and sessionId are required; everything else has a sensible default.
+​
+Required options
+​
+store
+WaStorerequired
+The store instance built by createStore. Holds every per-session domain (auth, signal, app-state, …).
+​
+sessionId
+stringrequired
+Logical session identifier — it keys every domain inside store. Use a stable string per device/account. Changing it between runs orphans the previous credentials and forces re-pairing.
+​
+Sessions and multi-tenancy
+Every store domain is keyed by sessionId, so a single store can hold many independent accounts. To run several accounts in one process, create one WaClient per sessionId over the same store:
+const store = createStore({ /* ... */ })
+
+const accountA = new WaClient({ store, sessionId: 'account-a' }, logger)
+const accountB = new WaClient({ store, sessionId: 'account-b' }, logger)
+
+await Promise.all([accountA.connect(), accountB.connect()])
+Each client pairs and reconnects independently. For the full picture — what’s per-session vs shared, the single-writer rule across processes, memory budget, sharding, and shutdown — see Multi-session deployments.
+​
+Device fingerprint
+These control how the device appears under Linked devices on the phone:
+​
+deviceBrowser
+stringdefault:"'chrome'"
+Browser id advertised during pairing ('chrome', 'firefox', 'safari', …; see WA_BROWSERS). Drives the Linked Devices label.
+​
+devicePlatform
+string
+Numeric companion platform id override (WA_COMPANION_PLATFORM_IDS). Inferred from deviceBrowser when omitted; set explicitly for non-browser platforms.
+​
+deviceOsDisplayName
+string
+Human-readable OS name shown under Linked devices ('Windows', 'Mac OS', 'Linux', …). Defaults to the current runtime’s OS.
+​
+deviceOsVersion
+string
+OS version advertised in DeviceProps.version ('10', '14.6', …). Defaults to the detected runtime OS version. Set this alongside deviceOsDisplayName when advertising an OS the process is not running on, so the name and version stay a matching pair. Values that are not dotted-numeric leave the field unset — matching how WhatsApp Web itself behaves.
+new WaClient({
+  store,
+  sessionId: 'default',
+  deviceBrowser: 'Chrome',
+  deviceOsDisplayName: 'Mac OS',
+  deviceOsVersion: '14.6'
+}, logger)
+For the MCP server the same overrides are available as MCP_DEVICE_OS_DISPLAY / MCP_DEVICE_OS_VERSION environment variables — when only the version is set the display name is still derived from the host, so pin both to keep the advertised pair consistent.
+​
+History sync
+​
+history
+WaHistorySyncOptions
+Controls processing of historySyncNotification chunks — both the initial bootstrap WhatsApp pushes after pairing and the on-demand backfill triggered by message.requestHistorySync.
+enabled?: boolean — process incoming history chunks. Default true. Set to false to drop them silently (useful when you don’t persist mailbox/threads/contacts and the conversation download would just burn bandwidth). The lib still acks the chunk so the server stops re-sending it, matching wa-web.
+requireFullSync?: boolean — request the full archive instead of just recent chats.
+groupBundles?: boolean — opt into downloading the group-history bundle a member may share after somebody joins a group; emits group_history_bundle. Off by default — a bundle is media a third party pushes at this account unprompted, so fetching it is opt-in. Bundles addressed to other members are dropped either way. See Groups → sharing group history.
+Chunks are decrypted, inflated, and parsed incrementally — one message is alive at a time as the proto stream descends into conversations, so a large chat that would materialize into hundreds of MB of JS objects stays flat. Group history bundles get the same treatment. There is no consumer-facing knob; peak memory during ingest just stopped tracking chunk size.
+new WaClient({
+  store,
+  sessionId: 'default',
+  history: { enabled: true, requireFullSync: true }
+}, logger)
+History arrives as history_sync_chunk events.
+​
+Timeouts
+All in milliseconds; defaults are tuned for production.
+Option	Purpose
+iqTimeoutMs	Default timeout for IQ queries (default 60s).
+nodeQueryTimeoutMs	Default timeout for raw node query() calls.
+keepAliveIntervalMs	Interval between keep-alive ping IQs.
+deadSocketTimeoutMs	How long without a reply before the socket is considered dead.
+mediaTimeoutMs	Media upload/download timeout.
+appStateSyncTimeoutMs	App-state sync round timeout.
+messageAckTimeoutMs	How long message.send waits for the server <ack> per attempt.
+messageMaxAttempts	Max attempts for a single message.send.
+messageRetryDelayMs	Delay between message-send retries.
+signalFetchKeyBundlesTimeoutMs	Timeout for Signal prekey-bundle fetches.
+​
+WhatsApp version
+zapo ships with a tested production version baked in per transport. WhatsApp occasionally rejects older clients during the noise handshake with HTTP 405 / failure_client_too_old. You have three options to recover.
+​
+version
+string | () => string | Promise<string>
+Override the version string the client advertises. Either a literal or a resolver invoked once per connect() — useful for fetching the current version lazily without rebuilding the client. The accepted shape depends on the transport resolved for the connect:
+Web takes a 3- to 5-part version (2.3000.x[.y.z]); the 4th and 5th parts, when supplied, are advertised in the noise payload.
+Mobile takes exactly a 4-part Android app version (2.26.x.y); it overrides mobileTransport.deviceInfo.appVersion in the login payload.
+An invalid part count for the resolved transport throws on connect().
+​
+recoverFromClientTooOld
+booleandefault:"false"
+When true, on failure_client_too_old the client logs a warning, fetches the current version for the active transport (fetchLatestWaWebVersion() for Web, fetchLatestWaMobileVersion() for Mobile), applies it as a one-shot override, and reconnects automatically. On Mobile the override is applied by refreshing deviceInfo.appVersion for the next connect. Treat it as a stopgap until you upgrade zapo — the bundled default is still the recommended path.
+import { WaClient, fetchLatestWaWebVersion } from 'zapo-js'
+
+// Pin a specific version
+new WaClient({ store, sessionId: 'default', version: '2.3000.1027421623' }, logger)
+
+// Resolve lazily on each connect()
+new WaClient({
+  store,
+  sessionId: 'default',
+  version: async () => (await fetchLatestWaWebVersion()).version
+}, logger)
+
+// Auto-recover from HTTP 405 once
+new WaClient({ store, sessionId: 'default', recoverFromClientTooOld: true }, logger)
+​
+fetchLatestWaWebVersion()
+Scrapes the current client_revision from web.whatsapp.com/sw.js and returns a version string in the 2.3000.x form accepted by version for a Web session.
+import { fetchLatestWaWebVersion } from 'zapo-js'
+
+const { version, parts } = await fetchLatestWaWebVersion({
+  timeoutMs: 10_000,
+  // Route through the same dispatcher you use for media / link-preview
+  proxy: dispatcher
+})
+Options: timeoutMs (default 10s), proxy (undici dispatcher only — http.Agent is not honored by the global fetch), signal, userAgent, headers, and a fetch override for tests. Network and parse errors throw — wrap in try/catch if you want to fall back to the bundled default.
+
+Presence on connect
+
+markOnlineOnConnect
+booleandefault:"false"
+false (default) — announce as unavailable. Matches WhatsApp Web when the tab is not focused, and keeps headless bots invisible by default. With this off, you keep receiving notifications for messages while “offline”.
+true — announce the client as online (matches WhatsApp Web with the tab focused at login time).
+
+Passkey-gated linking
+
+signPasskeyAssertion
+WaShortcakeAssertionSigner
+External WebAuthn signer for the server-forced Shortcake passkey handshake. Called with the raw PublicKeyCredentialRequestOptions (Uint8Array) the server issued; must return { credentialId, webauthnAssertion }. The credential source (real / virtual authenticator, relay) stays outside the library.
+Without this, an account that gets a server-forced passkey prologue emits auth_passkey_required with hasSigner: false and the link stalls — see the reverse-engineering deep dive for the wire-level detail.
+
+Addons (reactions, poll votes)
+
+addons
+{ autoDecrypt?: boolean, persistAllSecrets?: boolean }default:"{ autoDecrypt: true, persistAllSecrets: false }"
+Encrypted addons (poll votes, reactions, message edits, …) are decrypted automatically and emitted as typed message_addon events. Set autoDecrypt: false to receive them encrypted and decrypt yourself via client.message.tryDecryptAddon(event). The parent message secret is looked up in the messageSecret cache first, then in the messages store.
+persistAllSecrets: true persists the 32-byte message secret of every sent and received message, not just the poll / event / bot-prompt ones the library knows will get a follow-up. Encrypted addons whose parent can be any message type — reactions, comments, secretEncryptedMessage edits — need the parent’s secret to decrypt; without this flag, those parents stay decryptable across a restart only when the full messages archive is persistent. Use it to keep them decryptable while storing only the secret (messages: 'none').
+Has no effect when the messageSecret cache is 'none' — every secret write lands in the noop store and is silently discarded. With the default 'memory' provider it works for the lifetime of the process but is lost on restart and bounded by the cache’s LRU and messageSecretMs TTL; point messageSecret at a persistent backend to keep secrets across restarts.
+
+Media
+
+media
+WaMediaOptions
+Media processing. Pass a processor (from @zapo-js/media-utils) to generate thumbnails/previews, probe dimensions and durations, and build voice-note waveforms before upload — then toggle each step. Without a processor media still uploads, just without this processing. See the media guide for the full wiring.
+processor?: WaMediaProcessor — the processor instance
+generateThumbnail?: boolean — image/video preview thumbnails
+generateProbe?: boolean — probe width/height/duration
+generateWaveform?: boolean — voice-note (PTT) waveform
+generateStickerThumbnail?: boolean
+normalizeVoiceNote?: boolean — re-encode PTT audio to the format WhatsApp expects
+
+Link previews
+
+linkPreview
+WaLinkPreviewOptions
+Global configuration for the built-in link-preview fetcher used when sending text that contains a URL. Override per message with the linkPreview send option.
+enabled?: boolean — turn automatic link-preview fetching on or off globally
+fetchTimeoutMs?: number — how long to wait for the target page
+uploadHqThumbnail?: boolean — upload a high-resolution preview thumbnail
+allowPrivateHosts?: boolean — allow fetching private/loopback addresses (off by default, as an SSRF guard)
+maxHtmlBytes?: number / maxThumbnailBytes?: number — size caps for the fetched HTML and image
+userAgent?: string — User-Agent sent when fetching
+proxy?: WaProxyTransport — proxy just this fetcher (same as proxy.linkPreview)
+fetcher?: WaLinkPreviewFetcher — replace the default fetcher entirely (e.g. your own scraping pipeline)
+
+
+Core concepts
+Configuration
+Core concepts
+Configuration
+
+Copy page
+
+Configure WaClient: sessions, timeouts, history sync, presence on connect, addons, proxy, logging, logout cleanup, and production knobs.
+
+WaClient takes a WaClientOptions object and an optional logger:
+const client = new WaClient(options, logger)
+Only store and sessionId are required; everything else has a sensible default.
+​
+Required options
+​
+store
+WaStorerequired
+The store instance built by createStore. Holds every per-session domain (auth, signal, app-state, …).
+​
+sessionId
+stringrequired
+Logical session identifier — it keys every domain inside store. Use a stable string per device/account. Changing it between runs orphans the previous credentials and forces re-pairing.
+​
+Sessions and multi-tenancy
+Every store domain is keyed by sessionId, so a single store can hold many independent accounts. To run several accounts in one process, create one WaClient per sessionId over the same store:
+const store = createStore({ /* ... */ })
+
+const accountA = new WaClient({ store, sessionId: 'account-a' }, logger)
+const accountB = new WaClient({ store, sessionId: 'account-b' }, logger)
+
+await Promise.all([accountA.connect(), accountB.connect()])
+Each client pairs and reconnects independently. For the full picture — what’s per-session vs shared, the single-writer rule across processes, memory budget, sharding, and shutdown — see Multi-session deployments.
+​
+Device fingerprint
+These control how the device appears under Linked devices on the phone:
+​
+deviceBrowser
+stringdefault:"'chrome'"
+Browser id advertised during pairing ('chrome', 'firefox', 'safari', …; see WA_BROWSERS). Drives the Linked Devices label.
+​
+devicePlatform
+string
+Numeric companion platform id override (WA_COMPANION_PLATFORM_IDS). Inferred from deviceBrowser when omitted; set explicitly for non-browser platforms.
+​
+deviceOsDisplayName
+string
+Human-readable OS name shown under Linked devices ('Windows', 'Mac OS', 'Linux', …). Defaults to the current runtime’s OS.
+​
+deviceOsVersion
+string
+OS version advertised in DeviceProps.version ('10', '14.6', …). Defaults to the detected runtime OS version. Set this alongside deviceOsDisplayName when advertising an OS the process is not running on, so the name and version stay a matching pair. Values that are not dotted-numeric leave the field unset — matching how WhatsApp Web itself behaves.
+new WaClient({
+  store,
+  sessionId: 'default',
+  deviceBrowser: 'Chrome',
+  deviceOsDisplayName: 'Mac OS',
+  deviceOsVersion: '14.6'
+}, logger)
+For the MCP server the same overrides are available as MCP_DEVICE_OS_DISPLAY / MCP_DEVICE_OS_VERSION environment variables — when only the version is set the display name is still derived from the host, so pin both to keep the advertised pair consistent.
+​
+History sync
+​
+history
+WaHistorySyncOptions
+Controls processing of historySyncNotification chunks — both the initial bootstrap WhatsApp pushes after pairing and the on-demand backfill triggered by message.requestHistorySync.
+enabled?: boolean — process incoming history chunks. Default true. Set to false to drop them silently (useful when you don’t persist mailbox/threads/contacts and the conversation download would just burn bandwidth). The lib still acks the chunk so the server stops re-sending it, matching wa-web.
+requireFullSync?: boolean — request the full archive instead of just recent chats.
+groupBundles?: boolean — opt into downloading the group-history bundle a member may share after somebody joins a group; emits group_history_bundle. Off by default — a bundle is media a third party pushes at this account unprompted, so fetching it is opt-in. Bundles addressed to other members are dropped either way. See Groups → sharing group history.
+Chunks are decrypted, inflated, and parsed incrementally — one message is alive at a time as the proto stream descends into conversations, so a large chat that would materialize into hundreds of MB of JS objects stays flat. Group history bundles get the same treatment. There is no consumer-facing knob; peak memory during ingest just stopped tracking chunk size.
+new WaClient({
+  store,
+  sessionId: 'default',
+  history: { enabled: true, requireFullSync: true }
+}, logger)
+History arrives as history_sync_chunk events.
+​
+Timeouts
+All in milliseconds; defaults are tuned for production.
+Option	Purpose
+iqTimeoutMs	Default timeout for IQ queries (default 60s).
+nodeQueryTimeoutMs	Default timeout for raw node query() calls.
+keepAliveIntervalMs	Interval between keep-alive ping IQs.
+deadSocketTimeoutMs	How long without a reply before the socket is considered dead.
+mediaTimeoutMs	Media upload/download timeout.
+appStateSyncTimeoutMs	App-state sync round timeout.
+messageAckTimeoutMs	How long message.send waits for the server <ack> per attempt.
+messageMaxAttempts	Max attempts for a single message.send.
+messageRetryDelayMs	Delay between message-send retries.
+signalFetchKeyBundlesTimeoutMs	Timeout for Signal prekey-bundle fetches.
+​
+WhatsApp version
+zapo ships with a tested production version baked in per transport. WhatsApp occasionally rejects older clients during the noise handshake with HTTP 405 / failure_client_too_old. You have three options to recover.
+​
+version
+string | () => string | Promise<string>
+Override the version string the client advertises. Either a literal or a resolver invoked once per connect() — useful for fetching the current version lazily without rebuilding the client. The accepted shape depends on the transport resolved for the connect:
+Web takes a 3- to 5-part version (2.3000.x[.y.z]); the 4th and 5th parts, when supplied, are advertised in the noise payload.
+Mobile takes exactly a 4-part Android app version (2.26.x.y); it overrides mobileTransport.deviceInfo.appVersion in the login payload.
+An invalid part count for the resolved transport throws on connect().
+​
+recoverFromClientTooOld
+booleandefault:"false"
+When true, on failure_client_too_old the client logs a warning, fetches the current version for the active transport (fetchLatestWaWebVersion() for Web, fetchLatestWaMobileVersion() for Mobile), applies it as a one-shot override, and reconnects automatically. On Mobile the override is applied by refreshing deviceInfo.appVersion for the next connect. Treat it as a stopgap until you upgrade zapo — the bundled default is still the recommended path.
+import { WaClient, fetchLatestWaWebVersion } from 'zapo-js'
+
+// Pin a specific version
+new WaClient({ store, sessionId: 'default', version: '2.3000.1027421623' }, logger)
+
+// Resolve lazily on each connect()
+new WaClient({
+  store,
+  sessionId: 'default',
+  version: async () => (await fetchLatestWaWebVersion()).version
+}, logger)
+
+// Auto-recover from HTTP 405 once
+new WaClient({ store, sessionId: 'default', recoverFromClientTooOld: true }, logger)
+​
+fetchLatestWaWebVersion()
+Scrapes the current client_revision from web.whatsapp.com/sw.js and returns a version string in the 2.3000.x form accepted by version for a Web session.
+import { fetchLatestWaWebVersion } from 'zapo-js'
+
+const { version, parts } = await fetchLatestWaWebVersion({
+  timeoutMs: 10_000,
+  // Route through the same dispatcher you use for media / link-preview
+  proxy: dispatcher
+})
+Options: timeoutMs (default 10s), proxy (undici dispatcher only — http.Agent is not honored by the global fetch), signal, userAgent, headers, and a fetch override for tests. Network and parse errors throw — wrap in try/catch if you want to fall back to the bundled default.
+​
+fetchLatestWaMobileVersion()
+Scrapes the current WhatsApp for Android version from a public app-listing page and returns a 4-part 2.26.x.y string suitable for version on a Mobile session (or as an override for mobileTransport.deviceInfo.appVersion).
+import { fetchLatestWaMobileVersion } from 'zapo-js'
+
+const { version, parts } = await fetchLatestWaMobileVersion({
+  timeoutMs: 10_000,
+  proxy: dispatcher
+})
+Options: everything the Web fetcher accepts (timeoutMs, proxy, signal, userAgent, headers, fetch) plus:
+url?: string — override the page to scrape. The default source is a public app-listing mirror because WhatsApp’s own whatsapp.com/android page only shows the stale minimum-requirement version; retarget if the layout changes or is unreachable from your network.
+versionPattern?: RegExp — override the extraction regex. Must expose the version in capture group 1. The default matches a 4-part 2.x.x.x and returns the first hit on the page.
+The parsed string must have exactly four numeric parts; anything else throws (invalid wa-mobile version parsed from page). Network and parse errors throw — wrap in try/catch if you want to fall back to a known-good hardcoded version.
+​
+Presence on connect
+​
+markOnlineOnConnect
+booleandefault:"false"
+false (default) — announce as unavailable. Matches WhatsApp Web when the tab is not focused, and keeps headless bots invisible by default. With this off, you keep receiving notifications for messages while “offline”.
+true — announce the client as online (matches WhatsApp Web with the tab focused at login time).
+​
+Passkey-gated linking
+​
+signPasskeyAssertion
+WaShortcakeAssertionSigner
+External WebAuthn signer for the server-forced Shortcake passkey handshake. Called with the raw PublicKeyCredentialRequestOptions (Uint8Array) the server issued; must return { credentialId, webauthnAssertion }. The credential source (real / virtual authenticator, relay) stays outside the library.
+Without this, an account that gets a server-forced passkey prologue emits auth_passkey_required with hasSigner: false and the link stalls — see the reverse-engineering deep dive for the wire-level detail.
+​
+Addons (reactions, poll votes)
+​
+addons
+{ autoDecrypt?: boolean, persistAllSecrets?: boolean }default:"{ autoDecrypt: true, persistAllSecrets: false }"
+Encrypted addons (poll votes, reactions, message edits, …) are decrypted automatically and emitted as typed message_addon events. Set autoDecrypt: false to receive them encrypted and decrypt yourself via client.message.tryDecryptAddon(event). The parent message secret is looked up in the messageSecret cache first, then in the messages store.
+persistAllSecrets: true persists the 32-byte message secret of every sent and received message, not just the poll / event / bot-prompt ones the library knows will get a follow-up. Encrypted addons whose parent can be any message type — reactions, comments, secretEncryptedMessage edits — need the parent’s secret to decrypt; without this flag, those parents stay decryptable across a restart only when the full messages archive is persistent. Use it to keep them decryptable while storing only the secret (messages: 'none').
+Has no effect when the messageSecret cache is 'none' — every secret write lands in the noop store and is silently discarded. With the default 'memory' provider it works for the lifetime of the process but is lost on restart and bounded by the cache’s LRU and messageSecretMs TTL; point messageSecret at a persistent backend to keep secrets across restarts.
+​
+Media
+​
+media
+WaMediaOptions
+Media processing. Pass a processor (from @zapo-js/media-utils) to generate thumbnails/previews, probe dimensions and durations, and build voice-note waveforms before upload — then toggle each step. Without a processor media still uploads, just without this processing. See the media guide for the full wiring.
+processor?: WaMediaProcessor — the processor instance
+generateThumbnail?: boolean — image/video preview thumbnails
+generateProbe?: boolean — probe width/height/duration
+generateWaveform?: boolean — voice-note (PTT) waveform
+generateStickerThumbnail?: boolean
+normalizeVoiceNote?: boolean — re-encode PTT audio to the format WhatsApp expects
+​
+Link previews
+​
+linkPreview
+WaLinkPreviewOptions
+Global configuration for the built-in link-preview fetcher used when sending text that contains a URL. Override per message with the linkPreview send option.
+enabled?: boolean — turn automatic link-preview fetching on or off globally
+fetchTimeoutMs?: number — how long to wait for the target page
+uploadHqThumbnail?: boolean — upload a high-resolution preview thumbnail
+allowPrivateHosts?: boolean — allow fetching private/loopback addresses (off by default, as an SSRF guard)
+maxHtmlBytes?: number / maxThumbnailBytes?: number — size caps for the fetched HTML and image
+userAgent?: string — User-Agent sent when fetching
+proxy?: WaProxyTransport — proxy just this fetcher (same as proxy.linkPreview)
+fetcher?: WaLinkPreviewFetcher — replace the default fetcher entirely (e.g. your own scraping pipeline)
+​
+Chat events
+​
+chatEvents
+{ emitSnapshotMutations?: boolean }
+Set emitSnapshotMutations: true to re-emit mutation events for every change seen during an app-state snapshot sync. Off by default, since snapshot mutations represent historical state rather than live changes.
+​
+Write-behind persistence
+​
+writeBehind
+WaWriteBehindOptions
+Batches incoming messages before flushing to the messages / threads / contacts stores.
+maxPendingKeys?: number
+maxWriteConcurrency?: number
+flushTimeoutMs?: number
+​
+Proxy
+​
+proxy
+WaClientProxyOptions
+Route each leg through a proxy independently:
+ws — the WebSocket connection.
+mediaUpload / mediaDownload — media transfers.
+linkPreview — the default link-preview fetcher.
+Each leg accepts a WaProxyTransport, which is either:
+an undici dispatcher (WaProxyDispatcher, e.g. an undici ProxyAgent) — used for the fetch-based legs (media, link preview), or
+a Node http/https Agent (WaProxyAgent) — used for the WebSocket (ws) leg.
+zapo picks the right form per leg automatically.
+The ws leg requires the ws package, because the runtime’s native WebSocket cannot accept an HTTP Agent. Without a proxy, no extra package is needed.
+​
+HTTP / HTTPS proxy
+Use an undici ProxyAgent (a dispatcher) for the media/link-preview legs, and an https-proxy-agent (an http.Agent) for the ws leg:
+import { ProxyAgent } from 'undici'
+import { HttpsProxyAgent } from 'https-proxy-agent'
+
+const url = 'http://user:pass@proxy.example.com:8080' // or https://…
+const dispatcher = new ProxyAgent(url)
+const wsAgent = new HttpsProxyAgent(url)
+
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  proxy: {
+    ws: wsAgent,
+    mediaUpload: dispatcher,
+    mediaDownload: dispatcher,
+    linkPreview: dispatcher
+  }
+}, logger)
+
+SOCKS proxy
+Use socks-proxy-agent (works as an http.Agent for every leg, including ws):
+import { SocksProxyAgent } from 'socks-proxy-agent'
+
+// socks5 (or socks4) — host can be a domain or an IP
+const agent = new SocksProxyAgent('socks5://user:pass@127.0.0.1:1080')
+
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  proxy: { ws: agent, mediaUpload: agent, mediaDownload: agent, linkPreview: agent }
+}, logger)
+​
+IPv4 and IPv6 hosts
+The proxy host can be a domain or an IP literal. IPv6 addresses must be wrapped in brackets:
+// IPv4
+new ProxyAgent('http://203.0.113.10:8080')
+new SocksProxyAgent('socks5://203.0.113.10:1080')
+
+// IPv6 — bracket the address
+new ProxyAgent('http://[2001:db8::1]:8080')
+new SocksProxyAgent('socks5://[2001:db8::1]:1080')
+
+// With credentials
+new ProxyAgent('http://user:pass@[2001:db8::1]:8080')
+Point only the legs you need at a proxy — e.g. set just ws to tunnel the connection while letting media transfer directly, or vice-versa.
+​
+Logout store clearing
+​
+logoutStoreClear
+WaLogoutStoreClearOptions
+Per-domain control over what logout() wipes.
+By default, the mailbox archive (messages, threads, contacts) is preserved so the user keeps their history when re-pairing. Every other domain (credentials, Signal state, app-state, caches, privacy tokens) is cleared to start the next pair clean. Explicit true / false always wins over the default.
+// Preserve everything except auth (re-pair without touching state)
+logoutStoreClear: { signal: false, appState: false }
+
+// Wipe the mailbox too (full reset)
+logoutStoreClear: { messages: true, threads: true, contacts: true }
+​
+Logging
+WaClient accepts a Logger as the second constructor argument. Omit it and a default ConsoleLogger('info') is used. Levels, lowest to highest: trace, debug, info, warn, error.
+Two implementations ship with the package.
+​
+ConsoleLogger
+Zero-dependency. Writes structured records to console.log / console.warn / console.error. Good for development, tests, and serverless functions where you cannot add a logger transport.
+import { ConsoleLogger } from 'zapo-js'
+
+const client = new WaClient(options, new ConsoleLogger('info'))
+
+createPinoLogger
+Async factory that dynamically loads pino (and pino-pretty when pretty: true), configures it, and wraps it in a PinoLogger adapter. Throws optional dependency "pino" is not installed when pino is missing — install with npm i pino pino-pretty.
+import { createPinoLogger } from 'zapo-js'
+
+const logger = await createPinoLogger({ level: 'info', pretty: true })
+const client = new WaClient(options, logger)
+Field	Type	Description
+level	LogLevel	Minimum level to emit. Default 'info'.
+name	string	Pino instance name attached to every record.
+base	Record<string, unknown> | null	Base bindings merged into every record. Pass null to drop pino’s default pid/hostname.
+pinoOptions	Record<string, unknown>	Passthrough into pino() for anything not surfaced above (redaction, custom serializers, …).
+pretty	boolean	When true, wires pino-pretty as the transport. Keep at false (default) in production to emit JSON lines.
+prettyOptions	PinoPrettyOptions	Forwarded into the pino-pretty transport — see the pino-pretty options.
+​
+PinoLogger (bring your own Pino)
+If you already configure Pino centrally — child loggers, custom transports, file destinations — construct PinoLogger directly to wrap your existing instance. The factory is a convenience; the class is the actual adapter, and using it skips the dynamic pino import.
+import pino from 'pino'
+import { PinoLogger } from 'zapo-js'
+
+const root = pino({ name: 'my-app', transport: { /* ... */ } })
+const child = root.child({ component: 'whatsapp' })
+
+const client = new WaClient(options, new PinoLogger(child, 'info'))
+The signature is new PinoLogger(logger, level = 'info'). The level is forwarded to logger.level and used as the adapter’s reported level.
+
+
+Custom logger
+Need a sink the built-in implementations don’t cover — Datadog, OpenTelemetry, syslog, an internal observability pipeline? Implement the Logger interface and pass an instance to WaClient. The interface is small:
+import type { Logger, LogLevel } from 'zapo-js'
+
+interface Logger {
+  readonly level: LogLevel
+  trace(message: string, context?: Readonly<Record<string, unknown>>): void
+  debug(message: string, context?: Readonly<Record<string, unknown>>): void
+  info(message: string, context?: Readonly<Record<string, unknown>>): void
+  warn(message: string, context?: Readonly<Record<string, unknown>>): void
+  error(message: string, context?: Readonly<Record<string, unknown>>): void
+  /**
+   * Returns a derived logger that pre-binds `bindings` into every log call's
+   * context. Bindings stack: `parent.child(a).child(b)` merges `{ ...a, ...b }`.
+   * Per-call context wins on key conflicts.
+   */
+  child(bindings: Readonly<Record<string, unknown>>): Logger
+}
+LogLevel is 'trace' | 'debug' | 'info' | 'warn' | 'error'. The library calls the five level methods directly — there is no level-gating layer in front, so your implementation is responsible for filtering against this.level if you want to skip cheap calls.
+A minimal example that forwards to an external sink and tracks bindings through child():
+import type { Logger, LogLevel } from 'zapo-js'
+
+const LEVEL_RANK: Record<LogLevel, number> = {
+  trace: 10, debug: 20, info: 30, warn: 40, error: 50
+}
+
+class MyLogger implements Logger {
+  constructor(
+    public readonly level: LogLevel = 'info',
+    private readonly bindings: Readonly<Record<string, unknown>> = {}
+  ) {}
+
+  private write(at: LogLevel, message: string, context?: Readonly<Record<string, unknown>>): void {
+    if (LEVEL_RANK[at] < LEVEL_RANK[this.level]) return
+    sendToObservability({ level: at, message, ...this.bindings, ...context })
+  }
+
+  trace(message: string, context?: Readonly<Record<string, unknown>>) { this.write('trace', message, context) }
+  debug(message: string, context?: Readonly<Record<string, unknown>>) { this.write('debug', message, context) }
+  info(message: string, context?: Readonly<Record<string, unknown>>)  { this.write('info',  message, context) }
+  warn(message: string, context?: Readonly<Record<string, unknown>>)  { this.write('warn',  message, context) }
+  error(message: string, context?: Readonly<Record<string, unknown>>) { this.write('error', message, context) }
+
+  child(bindings: Readonly<Record<string, unknown>>): Logger {
+    return new MyLogger(this.level, { ...this.bindings, ...bindings })
+  }
+}
+
+const client = new WaClient(options, new MyLogger('info'))
+child() is used internally to attach per-component bindings (e.g. { component: 'noise' }, { component: 'signal', sessionId }). Returning a new instance with merged bindings — instead of mutating — keeps those tags scoped to the producing subsystem.
+
+Plugins
+​
+plugins
+readonly WaClientPluginDefinition[]
+Optional WaClient plugins — behavior hooks and/or coordinators exposed at client[exposeAs]. Authored with defineWaClientPlugin. The voice-calling plugin (@zapo-js/voip) is the reference implementation; see the plugin system page for how to wire and author plugins.
+import { voipPlugin } from '@zapo-js/voip'
+
+new WaClient({
+  store,
+  sessionId: 'default',
+  plugins: [voipPlugin()]
+}, logger)
+​
+Advanced options
+Rarely needed — listed for completeness.
+chatSocketUrls?: readonly string[] — override the WhatsApp chat WebSocket endpoint list (e.g. to route through a fake server in tests, or pin a specific edge).
+privacyToken?: WaPrivacyTokenOptions — tune trusted-contact-token (TC token) issuance: token durations and bucket counts.
+testHooks?: WaClientTestHooks — test-only fixtures (e.g. a custom Noise root CA). These do not bypass any security check; to actually skip a check, use the dangerous options below.
+​
+Dangerous options
+dangerous flags each disable a security check the production path enforces (signature verification, app-state MAC checks, …). They exist for testing against a fake server. Never enable them in production.
