@@ -2532,3 +2532,670 @@ const client = new WaClient({
   }
 }, logger)
 @zapo-js/media-utils shells out to ffmpeg/ffprobe and uses sharp. Make sure those binaries are available in your environment.
+
+
+Polls, reactions & edits
+
+Send polls and votes, react to messages, pin and edit content, revoke sent messages, and handle the events for each — through the typed content union.
+
+Beyond text and media, client.message.send accepts a family of typed interactive content objects. Each is discriminated by its type field.
+​
+Targeting a message
+Reply / reaction / revoke / pin / keep / event-response all accept a WaMessageTargetInput: either a received message event passed verbatim (its key is used) or an explicit WaMessageKey:
+interface WaMessageKey {
+  remoteJid: string     // the chat the target lives in
+  id: string            // the target's message (stanza) id
+  fromMe: boolean       // was the target sent by you?
+  participant?: string  // the author — required in groups when targeting someone else's message
+}
+The easiest path is to pass the event you already have — event.key is already a WaMessageKey:
+client.on('message', async (event) => {
+  // Use the event itself as the target — its key is read for you.
+  await client.message.send(event.key.remoteJid, {
+    type: 'reaction',
+    emoji: '👍',
+    target: event
+  })
+})
+​
+Reactions
+// Pass the event verbatim, or an explicit WaMessageKey
+await client.message.send(jid, {
+  type: 'reaction',
+  emoji: '👍',
+  target: event
+})
+Pass an empty string as emoji to remove a previous reaction:
+await client.message.send(jid, { type: 'reaction', emoji: '', target: event })
+​
+Polls
+const result = await client.message.send(jid, {
+  type: 'poll',
+  name: 'Lunch?',
+  options: ['Pizza', 'Sushi', 'Salad'],
+  selectableCount: 1,        // how many options a voter may pick
+  allowAddOption: false
+})
+Options may be plain strings or { name } objects. Order matters — it is used for vote hashing.
+​
+Voting on a poll
+Voting requires the original poll’s identity and its messageSecret (32 bytes from the poll’s messageContextInfo.messageSecret):
+await client.message.send(jid, {
+  type: 'poll-vote',
+  poll: {
+    id: pollStanzaId,                  // the poll's stanza id
+    fromMe: false,
+    authorJid: pollAuthorJid,
+    messageSecret: pollMessageSecret,  // Uint8Array, 32 bytes
+    participant: pollAuthorJid         // required outside 1:1 chats
+  },
+  selectedOptionNames: ['Pizza']       // exactly as they appeared in the poll
+})
+Incoming votes arrive as message_addon events once decrypted.
+​
+Editing a message
+To edit, send the new content and pass editKey in the options. The original must be fromMe. You can pass the received message event verbatim, its key, or an explicit WaSendEditKey ({ id, participant?, timestampMs? }):
+// Easiest: forward the original event
+await client.message.send(jid, 'Corrected text', { editKey: originalEvent })
+
+// Or build one explicitly
+await client.message.send(jid, 'Corrected text', {
+  editKey: {
+    id: originalStanzaId,
+    // participant required in groups for lid/pn-addressed originals
+    participant: undefined
+  }
+})
+The new payload is wrapped in a MESSAGE_EDIT protocol message targeting editKey.id.
+​
+Revoking (delete for everyone)
+// Easiest: pass the event you want to revoke
+await client.message.send(jid, { type: 'revoke', target: event })
+
+// Or build the target explicitly
+await client.message.send(jid, {
+  type: 'revoke',
+  target: {
+    remoteJid: jid,
+    id: targetStanzaId,
+    fromMe: true,
+    // participant required when an admin revokes someone else's message in a group
+    participant: undefined
+  }
+})
+Sender-vs-admin revoke is auto-detected from target.fromMe: false triggers an admin revoke. There is no subtype option to pass.
+​
+Pinning
+await client.message.send(jid, { type: 'pin', target: event })   // pin
+await client.message.send(jid, { type: 'unpin', target: event }) // unpin
+Pins expire — pass durationSecs to override the default. wa-web offers three presets:
+await client.message.send(jid, { type: 'pin', target: event, durationSecs: 604_800 })   // 7 days
+await client.message.send(jid, { type: 'pin', target: event, durationSecs: 2_592_000 }) // 30 days
+Default is 86_400 (24h). The TTL travels with the pin via messageContextInfo.messageAddOnDurationInSecs; without it receiving clients silently drop the pin, so the lib always stamps the default when you omit it. durationSecs is ignored on unpin.
+​
+Keep-in-chat
+For disappearing-message chats, keep (or un-keep) a specific message:
+await client.message.send(jid, { type: 'keep', target: event })
+await client.message.send(jid, { type: 'unkeep', target: event })
+​
+Events
+Create a calendar-style event message:
+await client.message.send(groupJid, {
+  type: 'event',
+  name: 'Team sync',
+  description: 'Weekly catch-up',
+  startTime: Math.floor(Date.now() / 1000) + 3600, // unix seconds
+  location: { latitude: -23.5, longitude: -46.6, name: 'HQ' },
+  joinLink: 'https://meet.example.com/abc',
+  hasReminder: true,
+  reminderOffsetSec: 600
+})
+Responding to an event
+await client.message.send(jid, {
+  type: 'event-response',
+  event: {
+    id: eventStanzaId,                 // the event's stanza id
+    fromMe: false,
+    authorJid: eventAuthorJid,
+    messageSecret: eventMessageSecret  // 32 bytes
+  },
+  response: 'going' // 'going' | 'not_going' | 'maybe'
+})
+
+Receiving messages
+
+Handle incoming message events: extract text and media, send delivery and read receipts, decrypt addons, and request older history.
+
+Incoming messages arrive on the message event as a WaIncomingMessageEvent.
+import type { WaIncomingMessageEvent } from 'zapo-js'
+
+client.on('message', (event: WaIncomingMessageEvent) => {
+  // ...
+})
+​
+The event payload
+WaIncomingMessageEvent carries a rich key (a superset of Proto.IMessageKey) plus a few top-level fields. Pass the event (or just its key) verbatim to reply / edit / react / revoke / pin / keep.
+Field	Type	Description
+key.remoteJid	string	Deviceless conversation JID (group or 1:1) — the :device segment is stripped; the device id is exposed via key.senderDevice.
+key.id	string	The message (stanza) id.
+key.fromMe	boolean	True when the message was sent by this account.
+key.participant	string?	The author in groups / broadcasts (omitted in 1:1).
+key.isGroup / key.isBroadcast / key.isNewsletter	boolean	Chat-kind flags derived from remoteJid.
+key.remoteJidAlt	string?	The remoteJid’s alternate addressing (PN if addressed by LID, or vice-versa) in 1:1 chats.
+key.participantAlt	string?	The participant’s alternate addressing in group chats.
+key.senderDevice	number	Sender’s device id; 0 when the source JID has no :device segment.
+key.senderUsername	string?	Author’s handle, without the @. Absent on self-authored 1:1 stanzas — the peer’s handle surfaces as key.recipientUsername instead.
+key.recipientUsername	string?	Peer’s handle, without the @. Populated on self-authored 1:1 stanzas (where senderUsername is absent) and on any message that carries recipient_username / peer_recipient_username.
+key.recipientJid / key.recipientAlt	string?	Your receiving JID and its alternate form.
+key.serverId	number?	Server-assigned message id for newsletter / channel messages.
+message	Proto.IMessage	The decrypted message content.
+timestampSeconds	number?	Server timestamp (unix seconds).
+expirationSeconds	number?	Disappearing-message TTL the sender attached to this message, when present.
+pushName	string?	The sender’s display name.
+You also receive your own outgoing messages here (multi-device sync), flagged with key.fromMe === true. Filter them out if you only want inbound traffic.
+The whole event (or event.key) is accepted as the target for replies/reactions/revokes/pins/keeps and as editKey for edits — no need to reshape it.
+​
+Extracting text
+A message’s text lives in different fields depending on its type. A small helper covers the common cases:
+function extractText(message?: Proto.IMessage | null): string | undefined {
+  if (!message) return undefined
+  return (
+    message.conversation ??
+    message.extendedTextMessage?.text ??
+    message.imageMessage?.caption ??
+    message.videoMessage?.caption ??
+    undefined
+  )
+}
+
+client.on('message', (event) => {
+  const text = extractText(event.message)
+  if (text) console.log(`${event.pushName}: ${text}`)
+})
+​
+Identifying the message type
+message is a protobuf union — inspect which field is set:
+client.on('message', (event) => {
+  const m = event.message
+  if (!m) return
+
+  if (m.conversation || m.extendedTextMessage) console.log('text')
+  else if (m.imageMessage) console.log('image')
+  else if (m.videoMessage) console.log('video')
+  else if (m.audioMessage) console.log('audio')
+  else if (m.documentMessage) console.log('document')
+  else if (m.stickerMessage) console.log('sticker')
+  else if (m.pollCreationMessage) console.log('poll')
+  else if (m.locationMessage) console.log('location')
+})
+To download media from an image/video/audio/document message, see Media → downloading.
+​
+Sending receipts
+client.message.sendReceipt marks messages as received/read/played. The easiest form takes the event(s) directly:
+client.on('message', async (event) => {
+  // mark as read
+  await client.message.sendReceipt(event, { type: 'read' })
+})
+You can also pass an array of events, or address it manually by JID and ids:
+await client.message.sendReceipt(chatJid, [id1, id2], { type: 'read' })
+​
+Calls
+Read-only
+Incoming call signaling surfaces as the read-only call event (WaIncomingCallEvent). zapo reports calls — it does not place, accept, or reject them.
+client.on('call', (event) => {
+  console.log(
+    event.type,          // 'offer' | 'accept' | 'terminate' | … | 'unknown'
+    event.isVideo ? 'video' : 'voice',
+    'from', event.callerPnJid ?? event.callCreatorJid,
+    event.groupJid ? `(group ${event.groupJid})` : ''
+  )
+})
+Useful fields: type (the signaling stage), callId, callCreatorJid / callerPnJid (who’s calling), isVideo, groupJid (group calls), and callerPushName. There is no API to answer a call.
+​
+Addons
+Addons are encrypted follow-ups attached to a message: reactions, poll votes, and comments. They surface as the message_addon event.
+​
+Automatic decryption
+Addons are decrypted and emitted for you by default — just subscribe to message_addon:
+const client = new WaClient({ store, sessionId: 'default' }, logger)
+
+client.on('message_addon', (event) => {
+  console.log('addon:', event)
+})
+​
+Manual decryption
+Pass addons: { autoDecrypt: false } to receive the encrypted payload and decrypt on demand from the originating message event:
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  addons: { autoDecrypt: false }
+}, logger)
+
+client.on('message', async (event) => {
+  await client.message.tryDecryptAddon(event)
+})
+​
+Recovering unavailable messages
+Some <message> stanzas arrive as an <unavailable/> placeholder rather than an encrypted body — a consumed view-once, a hosted or bot message the server could not fan out, or a plain fanout placeholder the primary still holds the plaintext for. All four flavors surface as the message_unavailable event with a kind discriminator.
+Plain fanout placeholders (kind === 'other') are recoverable: the lib queues a PLACEHOLDER_MESSAGE_RESEND peer request to the primary device, and the recovered payload arrives later as a regular message event with the same key.id. Consumers know to wait for it via resendRequested:
+client.on('message_unavailable', (event) => {
+  if (event.resendRequested) {
+    console.log('waiting for primary to resend', event.key.id)
+    // A `message` event with the same key.id will follow (best-effort)
+  }
+})
+The recovery is best-effort — the queued request is not persisted, so a failed peer message is not retried. resendRequested is false for the unrecoverable kinds ('view_once', 'hosted', 'bot'), for stanzas past the server age window (driven by the placeholder_message_resend_maximum_days_limit AB prop, not a hardcoded 30 days), and on mobile-primary sessions (there is no other device to ask). The lib does not time the pending resend out — a real primary can answer past the 30s peer-request default; wa-web behaves the same way.
+​
+Protocol messages
+Edits, revokes, and other protocol-level updates arrive on message_protocol as WaIncomingProtocolMessageEvent (it extends the message event with a protocolMessage field):
+client.on('message_protocol', (event) => {
+  console.log(event.protocolMessage)
+})
+​
+Requesting older history
+The initial pairing flow streams a bounded window of message history. To pull older messages for a specific chat on demand, call client.message.requestHistorySync:
+const { messageId } = await client.message.requestHistorySync({
+  chatJid,
+  oldestMsgId: topMessage.key.id,
+  oldestMsgFromMe: topMessage.key.fromMe,
+  oldestMsgTimestampMs: topMessage.timestampSeconds * 1000,
+  count: 50
+})
+The method returns once the request is dispatched — not when the chunk arrives. The backfill is delivered later as a history_sync_chunk event, same as the bootstrap history. Subscribe before calling if you need to react to it:
+client.on('history_sync_chunk', (event) => {
+  // event.conversations, event.pushnamesCount, event.progress, ...
+})
+
+await client.message.requestHistorySync({ chatJid })
+Pair oldestMsgId, oldestMsgFromMe, and oldestMsgTimestampMs from the topmost message currently visible to page backwards correctly. Omit count to let the server apply its own default (~50).
+​
+Receipts (inbound)
+When others read or play your messages, you receive receipt events:
+client.on('receipt', (event) => {
+  // event.status: 'delivered' | 'read' | 'played' | 'inactive'
+  for (const id of event.messageIds) {
+    console.log(event.status, 'for', id)
+  }
+})
+event.messageIds is the full set of stanza ids this receipt acknowledges. WhatsApp batches read/delivery receipts into a single <receipt> carrying a <list><item id=…/> block — messageIds mirrors wa-web’s externalIds: list items first, then event.stanzaId appended last. Single-message receipts contain just [event.stanzaId].
+WaIncomingReceiptEvent also carries participantUsername?: string — the participant’s handle without the @, read from the stanza’s participant_username attribute when present.
+receipt events still expose stanzaId / chatJid directly (they extend WaIncomingBaseEvent); the rename only applies to message, message_addon, and message_bot_chunk payloads, which now use event.key. event.stanzaId is still the last id in the batch — iterate messageIds to cover the rest.
+
+Managing chats
+
+Mute, pin, archive, mark as read, lock, star, clear, and delete WhatsApp chats with the typed client.chat coordinator backed by app-state mutations.
+
+Per-chat settings live on client.chat (WaAppStateMutationCoordinator). These are app-state mutations — they sync across all your linked devices, and changes made elsewhere arrive back as the mutation event.
+These operations affect your account’s view (and your other devices). They do not change anything for the other participants — e.g. deleting a chat doesn’t delete it for them. For delete-for-everyone, use a revoke.
+​
+Mute
+// Mute for 8 hours
+await client.chat.setChatMute(chatJid, true, Date.now() + 8 * 3600_000)
+
+// Unmute
+await client.chat.setChatMute(chatJid, false)
+muteEndTimestampMs is required when muting (epoch ms). For “mute forever”, pass a far-future timestamp. The client does not auto-unmute when the timer expires — that’s when WhatsApp re-enables notifications.
+​
+Pin & archive
+await client.chat.setChatPin(chatJid, true)      // pin
+await client.chat.setChatArchive(chatJid, true)  // archive
+Pin and archive are mutually exclusive — pinning a chat clears its archive flag and vice-versa. WhatsApp caps the number of pinned chats server-side.
+​
+Read / unread
+await client.chat.setChatRead(chatJid, true)   // mark read
+await client.chat.setChatRead(chatJid, false)  // mark unread
+​
+Lock
+await client.chat.setChatLock(chatJid, true)
+Locking also clears archive and pin.
+​
+Star a message
+A message is identified by a WaAppStateMessageKey:
+interface WaAppStateMessageKey {
+  chatJid: string
+  id: string            // the message (stanza) id
+  fromMe: boolean
+  participantJid?: string // group sender
+}
+
+await client.chat.setMessageStar(
+  { chatJid, id: stanzaId, fromMe: false, participantJid: senderJid },
+  true
+)
+​
+Clear & delete
+// Clear messages but keep the chat (local-only)
+await client.chat.clearChat(chatJid, { deleteStarred: false, deleteMedia: true })
+
+// Delete the chat entirely (removes it from the list + stored messages)
+await client.chat.deleteChat(chatJid, { deleteMedia: true })
+clearChat keeps starred messages and media by default; set deleteStarred / deleteMedia to wipe those too. Neither leaves a group — use client.group.leaveGroup for that.
+​
+Delete a message for me
+Removes a single message from your own device(s) only — recipients still see it:
+await client.chat.deleteMessageForMe(
+  { chatJid, id: stanzaId, fromMe: false },
+  { deleteMedia: true }
+)
+To delete for everyone instead, send a revoke.
+​
+Beyond the helpers
+The methods above are typed shortcuts. For anything without a dedicated helper — contacts, labels, quick replies, status privacy, and the full list of app-state schemas — use the generic client.chat.set() / client.chat.remove(). See the chat mutations reference.
+​
+Reacting to changes
+When a chat setting changes on another device, you receive a mutation event:
+client.on('mutation', (event) => {
+  console.log(event.collection, event.schema, event.operation)
+})
+
+
+Groups & communities
+
+Create groups, manage participants and admins, handle invites, configure community sub-groups, and react to group events with zapo.
+
+Group operations live on client.group (WaGroupCoordinator). Group JIDs end in @g.us.
+​
+Querying groups
+// All groups the account belongs to
+const groups = await client.group.queryAllGroups()
+
+// One group's metadata
+const meta = await client.group.queryGroupMetadata('123456@g.us')
+console.log(meta.subject, meta.participants.length)
+WaGroupMetadata includes the subject, owner, participant list (WaGroupParticipant[] with isAdmin / isSuperAdmin), and the full set of group flags (announce, restrict, ephemeral, community flags, …).
+​
+Creating a group
+createGroup returns the full WaGroupMetadata for the new group — no need to call queryGroupMetadata afterward:
+const group = await client.group.createGroup('My group', [
+  '5511999999999@s.whatsapp.net',
+  '5511888888888@s.whatsapp.net'
+])
+
+console.log(group.jid, group.participants.length)
+​
+Managing participants
+The four participant methods (addParticipants, removeParticipants, promoteParticipants, demoteParticipants) return a typed WaParticipantActionResult[] — one entry per jid you passed in. The IQ as a whole succeeds even when some participants fail (blocked you, privacy settings disallow add, already a member, …), so inspect the per-jid code to surface partial failures.
+const jids = ['5511999999999@s.whatsapp.net']
+
+const results = await client.group.addParticipants(groupJid, jids)
+
+for (const r of results) {
+  if (r.status === 'ok') {
+    console.log('added', r.jid)
+  } else {
+    // HTTP-style code: 403 = privacy block, 408 = not allowed,
+    // 409 = already in, 404 = not on WhatsApp, ...
+    console.warn('failed', r.jid, r.code)
+  }
+}
+
+await client.group.removeParticipants(groupJid, jids)
+await client.group.promoteParticipants(groupJid, jids) // make admin
+await client.group.demoteParticipants(groupJid, jids)  // remove admin
+Each result also carries phoneNumber and username when the server resolved them, plus the raw BinaryNode under raw for any extra tags the server attached (some 409/408 partial failures hint at how to recover).
+​
+Group settings
+await client.group.setSubject(groupJid, 'New name')
+await client.group.setDescription(groupJid, 'A description')   // null to clear
+await client.group.setSetting(groupJid, 'announcement', true)  // admins-only messages
+await client.group.setSetting(groupJid, 'restrict', true)      // admins-only edit info
+await client.group.setSetting(groupJid, 'ephemeral', true)     // disappearing messages on/off
+setSetting also covers the boolean toggles ephemeral, group_history, allow_admin_reports, no_frequently_forwarded, and the community flags. Use it to flip a feature on or off; for settings that need a value (mode or duration), use the dedicated setters below.
+​
+Who can add, link, and share history
+// Who can add new members
+await client.group.setMemberAddMode(groupJid, 'admin_add')        // admins only
+await client.group.setMemberAddMode(groupJid, 'all_member_add')   // anyone
+
+// Who can share the invite link
+await client.group.setMemberLinkMode(groupJid, 'admin_link')
+await client.group.setMemberLinkMode(groupJid, 'all_member_link')
+
+// Whether new members see prior chat history
+await client.group.setMemberShareGroupHistoryMode(groupJid, 'admin_share')      // hide history
+await client.group.setMemberShareGroupHistoryMode(groupJid, 'all_member_share') // expose backlog
+All three are admin-only — non-admins receive a 403 not-authorized error.
+​
+Disappearing messages
+setSetting(groupJid, 'ephemeral', false) is the explicit disable path. To turn disappearing messages on with a specific lifetime, use setEphemeralDuration:
+// 24h / 7d / 90d in seconds
+await client.group.setEphemeralDuration(groupJid, 86_400)
+await client.group.setEphemeralDuration(groupJid, 604_800)
+await client.group.setEphemeralDuration(groupJid, 7_776_000)
+
+// Disable
+await client.group.setSetting(groupJid, 'ephemeral', false)
+Admin-only. Passing 0 disables disappearing messages — the same as setSetting('ephemeral', false).
+​
+Invites
+// Preview an invite code (the path segment of chat.whatsapp.com/<code>)
+const info = await client.group.queryGroupInviteInfo('AbCdEf...')
+console.log(info.subject, info.size, info.desc)
+// info.participants is a trimmed sample — not the full roster.
+// Call queryGroupMetadata after joining for everyone.
+
+// Fetch the current invite code for a group you admin — does NOT rotate it.
+const code = await client.group.queryInviteCode(groupJid)
+console.log('current invite:', `https://chat.whatsapp.com/${code}`)
+
+// Join via invite code — returns the joined group's metadata
+const joined = await client.group.joinGroupViaInvite('AbCdEf...')
+console.log(joined.jid, joined.participants.length)
+
+// Rotate the invite — returns the freshly-issued code
+const { code: rotated, affectedParticipants } = await client.group.revokeInvite(groupJid)
+console.log('new invite:', `https://chat.whatsapp.com/${rotated}`)
+// affectedParticipants lists anyone who joined via the now-revoked code
+// that the server surfaced in the response (typically with code: 404).
+queryInviteCode and revokeInvite are admin-only — non-admins receive a 403 not-authorized.
+​
+Leaving
+await client.group.leaveGroup([groupJid]) // batched — accepts multiple
+leaveGroup resolves to void once the server acknowledges the request.
+​
+Membership approval
+For groups that require admin approval to join:
+const requests = await client.group.queryMembershipApprovalRequests(groupJid)
+
+await client.group.approveMembershipRequests(groupJid, [requesterJid])
+await client.group.rejectMembershipRequests(groupJid, [requesterJid])
+
+// Cancel your own pending request
+await client.group.cancelMembershipRequests(groupJid, [myJid])
+​
+Communities
+Communities are parent groups that link sub-groups:
+// Create a community
+const community = await client.group.createCommunity('My community')
+
+// Link / unlink existing groups as sub-groups
+await client.group.linkSubGroups(community.jid, [subGroupJidA, subGroupJidB])
+await client.group.unlinkSubGroups(community.jid, [subGroupJidA], {
+  removeOrphanedMembers: true
+})
+
+// List sub-groups (and the announcement group)
+const subs = await client.group.fetchSubGroups(community.jid)
+
+// Join a linked sub-group you don't yet belong to.
+// The IQ result carries no group payload — call queryGroupMetadata
+// on the sub-group after this resolves to get the full metadata.
+await client.group.joinLinkedGroup(community.jid, subGroupJid)
+const subMeta = await client.group.queryGroupMetadata(subGroupJid)
+
+// Merged participants across the whole community
+const everyone = await client.group.queryLinkedGroupsParticipants(community.jid)
+Other community operations include deactivateCommunity, transferCommunityOwnership, and fetchSubgroupSuggestions.
+​
+Sharing group history
+When a new member joins a group whose memberShareGroupHistoryMode exposes the backlog, any existing member can push the recent messages to them directly. Both sides live on client.message.
+​
+Sending
+const result = await client.message.shareGroupHistory('12036@g.us', {
+  toJids: ['5511999999999@s.whatsapp.net'],
+  count: 50 // default: group_history_message_count_limit (100)
+})
+
+console.log(result.bundleMessageId, result.messagesCount)
+shareGroupHistory(groupJid, input) resolves toJids against the live participant list, uploads the zlib-compressed GroupHistory payload, and fans the bundle out only to those receivers plus this account — members who are not receiving it never see the stanza. A group-wide notice message follows so other clients can render the “history was shared” marker.
+Input fields:
+toJids — required. Written in the group’s own addressing mode (a LID-addressed group only matches @lid entries; a PN one only matches @s.whatsapp.net). Read the mode off client.group.queryGroupMetadata(), whose participants carry both forms. Anything else throws.
+count?: number — how many of the most recent messages to read from the messages mailbox store. Ignored when messages is supplied.
+sinceMs?: number — only read messages at or after this ms timestamp from the store. Ignored when messages is supplied.
+messages?: readonly Proto.IWebMessageInfo[] — supply the messages directly, bypassing the mailbox store. Required when the messages store domain is 'none' (the default) — there is nothing to read back.
+outOfWindowPinnedMessages?: readonly Proto.IWebMessageInfo[] — pinned messages older than the shared window; the receiver injects these regardless of the age cutoff.
+WaShareGroupHistoryResult returns bundleMessageId, noticeMessageId? (absent when the notice failed to send after the bundle was already delivered — do not retry the share), messagesCount, historyReceivers, and nonHistoryReceivers.
+The sender side is gated per account by the group_history_send AB prop. When it is off, the server rejects the stanza with SMAX_INVALID after the upload is spent, so the client checks the prop up front and throws before uploading. Admin-only groups (memberShareGroupHistoryMode: 'admin_share') reject a share from a regular member server-side — check the mode with queryGroupMetadata first.
+​
+Receiving
+Downloading a bundle is opt-in — a bundle is media a third party pushes at this account unprompted. Enable it in the client config:
+new WaClient({
+  store,
+  sessionId: 'default',
+  history: { groupBundles: true }
+}, logger)
+
+client.on('group_history_bundle', (event) => {
+  console.log('history bundle for', event.groupJid,
+    '+', event.messagesCount, 'msgs',
+    '(dropped', event.droppedCount, ')')
+})
+The receiver verifies this account is in historyReceivers before spending a CDN fetch, drops stubs / foreign-chat / age-expired / ephemeral-expired entries, persists the rest, and emits group_history_bundle. Out-of-window pins ride along exempt from the age cutoff. Window limits come from the server-synced AB props, not hardcoded defaults.
+Bundles derive their media keys from a Group History HKDF context — distinct from history sync’s WhatsApp History Keys. Bundles addressed to other members are dropped either way.
+​
+Group events
+Changes made by others (subject, participants, settings) arrive on the group event:
+client.on('group', (event) => {
+  console.log(event.action, 'in', event.groupJid)
+})
+See Events for the full payload.
+
+Newsletters (channels)
+
+Create, discover, follow, post to, react on, and administer WhatsApp channels (newsletters) using the client.newsletter coordinator in zapo.
+
+Newsletters — WhatsApp channels — live on client.newsletter (WaNewsletterCoordinator). The coordinator combines three operation sets: discovery, admin, and messaging. Newsletter JIDs end in @newsletter.
+​
+Discovery
+// Fetch metadata by JID or invite code
+const meta = await client.newsletter.fetch('1234567890@newsletter')
+const byInvite = await client.newsletter.fetchByInvite('AbCdEf')
+
+// Channels the account follows
+const subscribed = await client.newsletter.listSubscribed()
+
+// Search the public directory
+const results = await client.newsletter.searchDirectory({ /* text, categories */ })
+
+// Recommendations & similar channels
+const recommended = await client.newsletter.fetchRecommended()
+const similar = await client.newsletter.fetchSimilar(newsletterJid)
+​
+Following
+await client.newsletter.follow(newsletterJid)
+await client.newsletter.unfollow(newsletterJid)
+await client.newsletter.mute({ newsletterJid, mute: true })
+​
+Posting
+send takes the same content union as a normal message — text, media, polls, and so on:
+const result = await client.newsletter.send(newsletterJid, 'Hello, subscribers!')
+
+// Edit a published message
+await client.newsletter.editMessage(newsletterJid, result.id, 'Edited')
+
+// Revoke it
+await client.newsletter.revoke({ newsletterJid, originalMessageId: result.id })
+​
+Reactions & poll votes
+await client.newsletter.react({ newsletterJid, parentMessageServerId, reactionCode: '🔥' })
+await client.newsletter.votePoll({ /* WaNewsletterVotePollInput */ })
+await client.newsletter.sendViewReceipt({ /* WaNewsletterViewReceiptInput */ })
+​
+Reading messages
+const page = await client.newsletter.fetchMessages({
+  newsletterJid,
+  count: 50
+})
+
+// Edits / reactions / poll updates since a point
+const updates = await client.newsletter.fetchMessageUpdates({
+  newsletterJid,
+  count: 50,
+  since: someTimestamp
+})
+
+// Live updates subscription
+const { durationSeconds } = await client.newsletter.subscribeLiveUpdates(newsletterJid)
+​
+Administration
+For channels the account owns:
+// Create a channel
+const created = await client.newsletter.create({ name: 'My channel', description: '...' })
+
+// Update editable fields (name / description / picture)
+await client.newsletter.update(newsletterJid, { name: 'Renamed' })
+
+// Delete
+await client.newsletter.delete(newsletterJid)
+
+// Admin views
+const adminInfo = await client.newsletter.fetchAdminInfo(newsletterJid)
+const followers = await client.newsletter.fetchFollowers(newsletterJid)
+const insights = await client.newsletter.fetchInsights(newsletterJid, metrics)
+​
+Admins & ownership
+await client.newsletter.createAdminInvite({ /* WaNewsletterAdminInviteInput */ })
+await client.newsletter.changeOwner({ /* ... */ })
+await client.newsletter.demoteAdmin({ /* ... */ })
+​
+Poll voters & reaction senders
+const voters = await client.newsletter.fetchPollVoters({
+  newsletterJid,
+  messageServerId,
+  voteHash
+})
+
+const reactors = await client.newsletter.fetchMessageReactionSenders({
+  newsletterJid,
+  messageServerId
+})
+​
+Events
+Newsletter activity arrives on newsletter, and edits/reactions/poll updates on newsletter_message_update:
+client.on('newsletter', (event) => console.log(event))
+client.on('newsletter_message_update', (event) => console.log(event))
+
+Broadcast lists
+
+Define a WhatsApp broadcast list with zapo and send a single message to many recipients at once without creating a group or revealing the list.
+
+A broadcast list sends a single message to many contacts at once — each recipient receives it as a normal 1:1 chat and can’t see who else is on the list. Broadcast lists live on client.broadcastList (WaBroadcastListCoordinator).
+Business-only
+Business-only. Broadcast lists are backed by the BusinessBroadcastList app-state schema and only work on WhatsApp Business accounts. On a regular account the server rejects the underlying mutations.
+​
+Defining a list
+setList creates or updates a list definition — it then appears under Broadcast lists on the phone, synced through app-state. Participants are identified by their LID (lidJid), optionally paired with the phone-number JID (pnJid):
+await client.broadcastList.setList({
+  id: 'list-1',
+  listName: 'Friends',
+  participants: [
+    { lidJid: 'a@lid', pnJid: 'a@s.whatsapp.net' },
+    { lidJid: 'b@lid' }
+  ],
+  labelIds: ['L1'] // optional — attach business labels
+})
+Remove a list by its id:
+await client.broadcastList.removeList('list-1')
+​
+Sending to a list
+send takes the same content union as client.message.send — text, media, polls, and so on — plus the broadcast listJid (the list id with an @broadcast suffix) and the explicit recipients to fan out to:
+const result = await client.broadcastList.send({
+  listJid: 'list-1@broadcast',
+  content: 'Weekend sale starts now! 🎉',
+  recipients: ['a@lid', 'b@lid']
+  // options: { ... }  // same shape as client.message.send options
+})
+
+console.log(result.id) // the published message id
+Each recipient is encrypted for individually (a fanout), so a single send call is effectively N direct sends behind one request. Pass the usual send options through options.
+Broadcast lists are not newsletters/channels: a broadcast reaches your existing contacts as private 1:1 messages, while a channel is a public, follower-based feed.
