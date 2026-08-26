@@ -3696,3 +3696,490 @@ client.on('stanza_error', (event) => {
   console.warn('stanza error', event.code, event.text)
 })
 A rejected client.message.send or client.lowlevel.query typically rejects its own promise too, so wrap individual calls in try/catch for per-operation handling; use stanza_error for visibility into errors that aren’t tied to a call you await.
+
+Multi-session deployments
+
+Run many WhatsApp accounts in one process with a shared store — what’s per-session vs shared, the single-writer rule, memory budget, sharding, and graceful shutdown.
+
+zapo is designed so a single process can drive many accounts off one shared store. Each account lives behind a stable sessionId; everything that’s safe to share (the backend connection pool, the WebSocket factory, the logger) is shared, and everything that’s account-specific (Signal sessions, identities, app-state, mailbox) is partitioned by sessionId.
+​
+The pattern
+import { createStore, WaClient, createPinoLogger } from 'zapo-js'
+import { createPostgresStore } from '@zapo-js/store-postgres'
+
+const store = createStore({
+  backends: { postgres: createPostgresStore({ pool: { connectionString: process.env.DATABASE_URL } }) },
+  providers: {
+    auth: 'postgres', signal: 'postgres', preKey: 'postgres',
+    session: 'postgres', identity: 'postgres', senderKey: 'postgres',
+    appState: 'postgres', privacyToken: 'postgres',
+    messages: 'postgres', threads: 'postgres', contacts: 'postgres'
+  }
+})
+
+const logger = await createPinoLogger({ level: 'info' })
+
+const clients = ['account-a', 'account-b', 'account-c'].map(
+  (id) => new WaClient({ store, sessionId: id }, logger)
+)
+
+await Promise.all(clients.map((c) => c.connect()))
+sessionId is the durable key for an account — same id across restarts resumes the same paired device. Changing it orphans the previous credentials.
+​
+What’s per-session vs shared
+Layer	Scope
+Backend connection pool / file handle	Shared across all sessions
+Per-domain stores (auth / signal / preKey / session / identity / senderKey / appState / privacyToken / messages / threads / contacts)	Per sessionId
+Cache domains (retry / groupMetadata / deviceList / messageSecret)	Per sessionId
+L1 cacheLayer (when enabled)	Per sessionId, per process
+memory.limits caps	Applied per session (multiply by N for total RAM)
+WaClient state (handlers, retry queue, coordinators)	Per WaClient instance
+Switching to a multi-tenant setup is a matter of (1) instantiating N WaClients on the same store, and (2) sizing your backend pool + memory budget for N concurrent sessions.
+​
+Session lifecycle
+store.session(sessionId) is memoized. The first call materializes the per-domain bundle (per-session locks, optional cache wrappers, …) and caches it inside the store; later calls with the same id return the same bundle.
+const a1 = store.session('account-a')
+const a2 = store.session('account-a')
+a1 === a2 // true
+WaClient calls store.session(sessionId) on demand; you do not usually call it yourself.
+​
+Adding tenants on the fly
+There is no preregistration step — just construct a new WaClient with a new sessionId:
+function spawn(sessionId: string): WaClient {
+  const client = new WaClient({ store, sessionId }, logger)
+  // hook your event listeners, then connect()
+  return client
+}
+​
+Removing tenants
+For long-running multi-tenant processes, three options — each with a different scope:
+await client.logout() — logical removal. Wipes the persistent state for that sessionId (subject to logoutStoreClear) and unlinks the device server-side. The bundle stays in the in-store map until you destroy it or the process ends; a subsequent WaClient({ store, sessionId }) on the same id reuses the same bundle.
+await storeSession.destroy() — mid-process reclaim. Tears down the session’s per-domain stores and evicts the bundle from the in-store map (the sessionId is released as destruction starts), so a concurrent or later store.session(id) builds a fresh bundle. The teardown is idempotent — repeat calls await the same in-flight promise — and teardown failures are logged, never thrown.
+await store.destroy() — process shutdown. Tears down every live session and the registered backends. store.session() throws afterwards; the store is single-shot.
+For a bounded reset that keeps the session alive, await storeSession.destroyCaches() swaps the cache domains (retry / groupMetadata / deviceList / messageSecret) for freshly-built instances instead of closing them — useful when you want to drop stale entries from a persistent cache backend without losing the session. Concurrent resets are serialized and cache references captured before the call reject afterwards, so recreate the client to pick up the fresh cache stores.
+session(id) returns the same bundle instance while it’s alive — so a WaClient holding a stale reference before you destroyed the session keeps hitting the closed bundle. In practice: destroy the client’s connection first (client.disconnect()), then session.destroy(), then build a new client if you want the same sessionId back.
+​
+Process ownership
+In multi-process deployments, decide how sessionIds map to processes:
+One process per sessionId via consistent hashing / sticky routing on the load balancer or queue (simplest).
+Leader election before opening the client (a Postgres advisory lock, Redis SET NX, etcd lease) — useful for HA failover.
+The opt-in cacheLayer tightens this: its L1 has no cross-process invalidation channel, so a sessionId’s backend rows should be owned by one process across its lifecycle. A takeover process’s L1 starts cold and may serve stale reads before catching up to writes the previous owner made.
+​
+Sharing a media processor
+WaMediaProcessor is a stateless wrapper around your media binaries (sharp, ffmpeg/ffprobe, file-type). The same instance can serve every WaClient — there is no per-session state inside the processor, so reusing it avoids paying the binary-lookup / lazy-import cost N times.
+import { createMediaProcessor } from '@zapo-js/media-utils'
+
+const processor = createMediaProcessor()
+
+const clients = tenants.map((id) => new WaClient(
+  { store, sessionId: id, media: { processor } }, // same instance, every session
+  logger
+))
+Each processor method receives an optional ctx: WaMediaProcessorCallContext argument carrying that call’s Logger. The runtime fills it with the calling session’s logger, so warnings (missing binary, failed detectMimetype, …) land with the right per-session bindings automatically — no setup needed. Custom processors should consume ctx.logger per call and not cache it, since the same instance is shared across sessions.
+​
+Memory budget
+WaCreateStoreOptions.memory.limits caps apply per session. With N concurrent sessions, the worst-case in-process RAM scales linearly:
+Cap	Per session	With N = 50 sessions
+signalSessions: 5_000	up to 5 000 Double-Ratchet entries	up to 250 000
+signalRemoteIdentities: 5_000	up to 5 000 identity rows	up to 250 000
+groupMetadataGroups: 1_000	up to 1 000 cached groups	up to 50 000
+messages: 10_000 (when providers.messages: 'memory')	up to 10 000 messages	up to 500 000
+Tune the per-session caps downward as N grows, or move the mailbox/large-cardinality domains to a persistent backend (the in-memory provider exists for tests and small accounts). TTLs in memory.cacheTtlMs are independent of N — they only cap how long an entry survives in each cache.
+​
+Sharding strategies
+Layout	Use when
+One process · N sessions · one store	A few tenants, all light traffic. Simplest setup; the process is a shared point of failure for all tenants.
+N processes · one session each · shared backend	High per-tenant load, or you want blast-radius isolation per tenant. The most robust at scale. Requires a network backend (@zapo-js/store-postgres / mysql / redis / mongo).
+K processes · M/K sessions each · shared backend	The middle ground at scale. Pack tenants per process until CPU saturates, then add a process. Pair with consistent hashing on sessionId so the same account always lands on the same process.
+@zapo-js/store-sqlite is single-host only and the SQLite file is held by one process — pick one of the network backends for any layout with more than one process.
+​
+Graceful shutdown
+async function shutdown() {
+  await Promise.all(clients.map((c) => c.disconnect()))
+  await store.destroy()
+}
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, shutdown)
+}
+client.disconnect() flushes the per-session write-behind queue and closes the socket without unlinking the device, so the next boot resumes from the store. store.destroy() then releases the shared backend (pool, file handle, …). Calling disconnect() on every client before store.destroy() ensures each session’s pending writes flush; store.destroy() does not do that for you.
+Don’t substitute logout() for disconnect() here — logout() unlinks the device server-side and clears stored state. Use it only when you intentionally want the account removed.
+
+Production & deployment
+
+Run zapo reliably in production: durable persistence, graceful shutdown, scaling multiple sessions, reconnection strategy, and the knobs that matter.
+
+zapo is built for long-lived, multi-session workloads. This page collects the operational decisions that matter once you move past a local prototype.
+​
+Persist credentials (don’t re-pair)
+Production sessions must use a durable store for the auth and Signal domains, plus a stable sessionId across restarts. The in-memory store loses everything on exit, forcing a re-pair on every boot.
+const client = new WaClient({ store, sessionId: 'tenant-42' }, logger)
+Changing sessionId orphans the previous credentials — treat it as the durable key for a device/account.
+​
+Choose a store backend
+Backend	Best for
+@zapo-js/store-sqlite	Single process / single host — the simplest, fastest local option.
+@zapo-js/store-postgres · @zapo-js/store-mysql	Multiple hosts, relational ops, managed backups.
+@zapo-js/store-redis	Low-latency cache + persistence.
+@zapo-js/store-mongo	Document-oriented deployments.
+You can mix backends per domain (e.g. auth/signal in Postgres, caches in Redis). See Installation and the stores reference.
+​
+Graceful shutdown
+Call disconnect() (never logout()) on shutdown — it flushes pending write-behind data and closes the socket without unlinking the device, so the next boot resumes from the store.
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, async () => {
+    await client.disconnect()
+    process.exit(0)
+  })
+}
+logout() unlinks the device server-side and clears stored state — it forces a full re-pair. Use it only to permanently disconnect, never as a shutdown hook.
+​
+Run many sessions
+A single store can hold many independent accounts, each keyed by sessionId. Create one WaClient per account:
+const clients = tenants.map((id) => new WaClient({ store, sessionId: id }, logger))
+await Promise.all(clients.map((c) => c.connect()))
+Each client pairs, reconnects, and emits events independently. Budget memory/CPU per session (each holds Signal state and in-memory caches), and shard across processes/hosts as you scale — one process per session is the simplest isolation model. See Multi-session deployments for the full operational guide.
+​
+Tune for throughput
+Write-behind batches incoming message/thread/contact writes off the hot path. Tune writeBehind.maxPendingKeys / maxWriteConcurrency / flushTimeoutMs to your database. (config)
+History sync (history.enabled) is on by default and adds a large initial download. Set it to false if you don’t persist mailbox/threads/contacts; set requireFullSync deliberately.
+Bots that shouldn’t appear online: markOnlineOnConnect defaults to false, so bots are invisible on connect out of the box. Pass true only when you want a visible “online” presence.
+Timeouts (iqTimeoutMs, keepAliveIntervalMs, deadSocketTimeoutMs, …) ship with production defaults — override only with a reason. (config)
+​
+Reconnection & error policy
+zapo does not auto-reconnect — own the policy. Wire a backoff loop (Reconnection) and classify failures (Errors & disconnects) so you stop on fatal reasons (banned, not_authorized, logout) instead of hammering the server.
+​
+Logging
+Use a structured logger in production:
+const logger = await createPinoLogger({ level: 'info', pretty: false })
+pretty: false emits JSON lines suited to log aggregators. Drop to debug / trace only when investigating.
+​
+Security & versioning
+Credentials are secrets. WaAuthCredentials holds the device keys — if you persist them outside the built-in store, encrypt at rest. (Authentication)
+Never enable dangerous.* in production — those flags disable security checks. (config)
+Versioning. zapo is 1.0 and follows semantic versioning — breaking changes only land in a new major. Use a version range or lockfile as usual, and review the changelog before major upgrades.
+
+End-to-end testing without WhatsApp
+
+Run your bot / CRM / notification pipeline against @zapo-js/fake-server — a real Noise / Signal / WhatsApp-protocol server in-process, no phone tied up, no risk to production accounts. Works with any conforming client (zapo, Baileys, whatsmeow).
+
+@zapo-js/fake-server is an in-process fake WhatsApp Web server that speaks Noise XX/IK, X3DH + Double Ratchet, group SenderKey, app-state sync, and media upload/download over self-signed HTTPS — everything a real conforming client sees on the wire. It exists so you can test your app end-to-end without touching WhatsApp: no phone tied up, no risk to a production account, no flakiness from a live network, CI-friendly.
+This guide targets app authors — bots, CRMs, notification services, integrations — regardless of whether the underlying WhatsApp library is zapo-js, Baileys, whatsmeow, or another conforming client. For the library-internal use (cross-check suite, benchmarks) see Dev tools.
+​
+Works with any WhatsApp library
+The fake server is a wire-level implementation of the WhatsApp protocol. It has no zapo-js dependency at runtime — it speaks the same Noise / Signal / app-state bytes as WhatsApp’s own edges. Strict clients (Baileys forks, whatsmeow, and others) work against it out of the box:
+The Noise cert chain sets notBefore / notAfter so validity-checking clients accept it as unexpired.
+The passive-set IQ and the encrypt <count> prekey-count query are answered by default (non-zapo clients block on both).
+After every login the server sends <ib><offline count="0"/></ib> so buffered-event clients flush.
+FakePeer message ids are WA-style hex — no @ characters that would tokenize as a JID in a strict decoder.
+If your app runs against a real WA edge, it should run against the fake one with only a URL / cert swap.
+​
+Install
+npm install --save-dev @zapo-js/fake-server zapo-js
+zapo-js is a peer dependency of the fake server (it imports the underlying Noise / Signal / crypto / proto primitives at runtime), so it needs to be present in the tree even when your app is built on a different WhatsApp library. Node.js >= 20.9.0.
+​
+Quick start (programmatic)
+The zapo-js wiring below is what a zapo-js app looks like; for Baileys / whatsmeow, keep your existing client setup and only override the socket URL, media proxy, and Noise root CA to point at the fake server.
+import { FakeWaServer } from '@zapo-js/fake-server'
+import { createStore, WaClient } from 'zapo-js'
+
+const server = await FakeWaServer.start()
+
+const client = new WaClient({
+  store: createStore({
+    providers: { auth: 'memory', signal: 'memory', senderKey: 'memory', appState: 'memory' }
+  }),
+  sessionId: 'test',
+  chatSocketUrls: [server.url],
+  testHooks: { noiseRootCa: server.noiseRootCa },
+  proxy: { mediaUpload: server.mediaProxyAgent, mediaDownload: server.mediaProxyAgent }
+})
+
+await client.connect()
+const pipeline = await server.waitForAuthenticatedPipeline()
+// ...drive the flow, assert on both sides...
+await server.stop()
+testHooks.noiseRootCa trusts the fake server’s certificate without bypassing verification — the full cert-chain check still runs.
+​
+Pinning across processes
+listen() mints a fresh random root CA per start and exposes the public half on server.noiseRootCa — perfect for the in-process test above, where the client is built after the server is listening. A client in a separate process has to pin the trust anchor before it dials, and at that point the server is not yet listening: there’s nothing to read back.
+Pass a noiseRootCa derived from a shared seed instead, so both sides can compute the same CA ahead of time:
+import { FakeWaServer, type FakeNoiseRootCa } from '@zapo-js/fake-server'
+import { deriveRootCaFromSeed } from './my-test-seed' // your own deterministic derivation
+
+const noiseRootCa: FakeNoiseRootCa = await deriveRootCaFromSeed(process.env.TEST_SEED!)
+
+// Server process
+const server = await FakeWaServer.start({ noiseRootCa })
+
+// Client process — pins the same anchor before dialling
+const client = new WaClient({
+  /* ... */,
+  testHooks: { noiseRootCa: { publicKey: noiseRootCa.publicKey, serial: noiseRootCa.serial } }
+})
+FakeNoiseRootCa carries the signing half — the server needs it to sign its cert chain — while the client only ever holds the public counterpart. It signs a chain no real WhatsApp client trusts, so it is test material rather than a real secret, but a seed committed beside the tests is the intended source, not one shared with anything that matters. Omitting the option keeps the previous behaviour: a fresh random CA per listen().
+​
+Simulating a peer
+createFakePeer gives you a simulated contact backed by real Signal crypto. Push messages to your client with sendConversation / sendGroupConversation, and capture what your client sends with expectMessage:
+const alice = await server.createFakePeer('5511999999999@s.whatsapp.net')
+
+// Your app receives this as a normal inbound message:
+await alice.sendConversation('hello from Alice')
+
+// Your app sends a reply; assert on the decrypted content:
+const outbound = await alice.expectMessage({ timeoutMs: 5_000 })
+expect(outbound.message?.conversation).toBe('hi Alice')
+The peer performs a real X3DH handshake, ratchets each message forward, and validates MACs — so a bug in your app’s Signal handling surfaces the same way it would against WhatsApp itself.
+​
+Asserting on outbound stanzas
+For assertions that don’t need a peer’s viewpoint (a <presence> your app sent, a <receipt> it acked, an IQ it made) subscribe to captured stanzas:
+const stanzas: BinaryNode[] = []
+server.onCapturedStanza((node) => stanzas.push(node))
+
+await client.presence.send('available')
+
+expect(stanzas.some((n) => n.tag === 'presence' && n.attrs.type === 'available')).toBe(true)
+onCapturedStanza returns an unsubscribe function; call it in afterEach to keep tests isolated.
+​
+Multi-session isolation
+Run many app instances against a single server without cross-talk. Provide a sessionKey resolver — the fake server routes each authenticated connection to its own FakeServerSession (isolated peers, groups, prekeys, app-state, captured stanzas):
+const server = await FakeWaServer.start({
+  sessionKey: ({ clientPayload }) =>
+    clientPayload.kind === 'login' ? clientPayload.username : 'pending'
+})
+
+// Spawn two apps against the same server (different sessionIds → different sessions):
+await appA.connect() // → session '<userA>'
+await appB.connect() // → session '<userB>'
+
+// Session-scoped operations:
+const alice = await server.sessionFor(pipelineA).createFakePeer(aliceJid)
+// or by key:
+const bob = await server.session('<userB>').createFakePeer(bobJid)
+The resolver runs once per connection, right after authentication, so info.clientPayload is available for keying by login identity. Server-wide handlers (server.registerIqHandler) still apply to every session; session-scoped ones (session.registerIqHandler) stay local.
+​
+Mobile primary + companion hosting
+To test a mobile-primary session — the client.mobile role, where zapo hosts companions — start the server with the raw TCP listener the mobile transport dials, and seed a registered primary into the store. Mobile registration happens out of band against WhatsApp’s HTTP endpoints, so the fake server can’t run it; seedFakeMobilePrimary writes the credentials directly.
+import { FakeWaServer, seedFakeMobilePrimary } from '@zapo-js/fake-server'
+import { createStore, WaClient } from 'zapo-js'
+
+const server = await FakeWaServer.start({ tcp: true })
+
+const store = createStore({})
+const primary = await seedFakeMobilePrimary(store, 'mobile-primary', {
+  phoneNumber: '5511999999999'
+})
+
+const client = new WaClient({
+  store,
+  sessionId: 'mobile-primary',
+  mobileTransport: {
+    deviceInfo: primary.deviceInfo,
+    tcpUrl: server.tcpUrl
+  },
+  testHooks: { noiseRootCa: server.noiseRootCa }
+})
+await client.connect()
+To drive companion linking against this primary, connect a second client as the companion and hand it refs via server.offerCompanionPairing(companionPipeline) — the inverse of runPairing. The primary signs the identity for real; the server just relays:
+const companion = new WaClient({ store: companionStore, sessionId: 'companion', /* ... */ })
+await companion.connect()
+const companionPipeline = await server.waitForAuthenticatedPipeline()
+
+// Push the refs the companion turns into a QR:
+const refs = await server.offerCompanionPairing(companionPipeline)
+
+// On the primary side, feed the QR string to client.mobile.linkCompanion(qr).
+// The primary signs and uploads pair-device; the server relays pair-success
+// back to the companion.
+This exercises the full client.mobile.linkCompanion / linkCompanionByCode handshake — signature, ADV epoch, key-index list republish, companion_host_linked event — end to end.
+Pairing by code runs between the two clients with the server in the middle; the fake server relays each stage. parseClientPayload on the pipeline classifies the login as web or mobile and surfaces the phone identity (manufacturer, model, os, app version, phone id) for assertions.
+​
+Programmatic config
+FakeWaServer.start(options) accepts:
+Option	Purpose
+port / path	Bind address override.
+tcp	true also starts a raw TCP listener beside the WebSocket one; a mobile-transport client dials it via server.tcpUrl. Default false.
+successNodeAttributes	Attributes stamped on the post-handshake <success/> node (lid, display name, props versions, …).
+defaultIqHandlers	false starts with an empty router — wire every response yourself via registerIqHandler. Default true.
+sessionKey	Multi-session resolver (see above).
+onPipeline(listener) fans out to multiple subscribers and returns an unsubscribe function; the pipeline’s parsed clientPayload is exposed on WaFakeConnectionPipeline for identity checks. IQ handlers may return null to fall through to the next matching handler (observe-then-delegate).
+​
+Standalone CLI
+The package ships a fake-wa-server binary. Run it once the dev dep is installed:
+npx fake-wa-server --port 5222 --peer 5511888@s.whatsapp.net --log
+The --pair <jid> mode drives QR pairing by prompting on stdin for the QR payload the client displays — pair once, then reconnect against the same fake server to iterate.
+​
+CI recipe
+Spin one server per test file (or per suite), tear it down at the end. memory providers on the client keep every test hermetic:
+import { FakeWaServer } from '@zapo-js/fake-server'
+import { afterAll, beforeAll, test } from 'vitest'
+
+let server: FakeWaServer
+
+beforeAll(async () => {
+  server = await FakeWaServer.start()
+})
+
+afterAll(async () => {
+  await server.stop()
+})
+
+test('bot replies to inbound message', async () => {
+  const app = await startYourApp({
+    socketUrl: server.url,
+    noiseRootCa: server.noiseRootCa,
+    mediaProxy: server.mediaProxyAgent
+  })
+  const alice = await server.createFakePeer('5511999999999@s.whatsapp.net')
+  await alice.sendConversation('hi')
+  const reply = await alice.expectMessage({ timeoutMs: 5_000 })
+  expect(reply.message?.conversation).toBe('hello, human')
+})
+Pair the fake server with in-memory stores on the client. Every test resets on run — no leaked pairing state, no fixture disk juggling.
+​
+Troubleshooting & FAQ
+
+Answers to the most common questions and pitfalls when running zapo: pairing failures, disconnects, missing events, history sync, and store corruption.
+
+It re-pairs (shows a QR) on every restart
+
+You’re almost certainly running on the in-memory store, which loses credentials when the process exits. Use a durable backend (SQLite, Postgres, …) for the auth domain, and keep a stable sessionId across runs — changing it orphans the previous credentials. See Stores.
+The client doesn't reconnect after a drop
+
+By design — zapo does not auto-reconnect. Listen for the connection event with status: 'close' and call connect() again (skip it when isLogout is true). See the reconnection pattern.
+My media sends but has no preview / dimensions / waveform
+
+Media still uploads without @zapo-js/media-utils — but without it there’s no processor to generate thumbnails/previews, image-video dimensions, or voice-note waveforms, so it can render as a plain attachment or with no preview. For proper media, install it (npm i @zapo-js/media-utils, plus ffmpeg/ffprobe) and wire a processor through the media option. See Media.
+Prefer a stream over a Buffer for media
+
+Pass a file path (string) or a Readable stream to media, not a Buffer — zapo streams the bytes through the pipeline so memory stays flat for large files. On download, prefer downloadToFile/download over downloadBytes.
+Proxy isn't being used
+
+The proxy.ws leg needs the ws package (the runtime’s native WebSocket can’t take an HTTP Agent). Media/link-preview legs use an undici dispatcher. See the proxy examples for SOCKS/HTTP/HTTPS and IPv4/IPv6.
+Which JID do I reply to in a group?
+
+Always reply to event.key.remoteJid (the group JID), never a participant’s JID. When you have a peer’s LID, prefer the LID — it’s the privacy-preserving, forward-compatible identity. See Identities (PN vs LID).
+I receive my own outgoing messages
+
+That’s multi-device sync — your own sends come back on the message event flagged key.fromMe === true. Filter them out if you only want inbound traffic. See Receiving messages.
+How do I type the message handler in TypeScript?
+
+Import the event type from the package root — all coordinator and event types are exported:
+import type { WaIncomingMessageEvent, WaGroupCoordinator } from 'zapo-js'
+
+client.on('message', (event: WaIncomingMessageEvent) => { /* ... */ })
+const groups: WaGroupCoordinator = client.group
+Can I register a brand-new number (mobile)?
+
+No. Mobile connections are stable, but zapo intentionally does not provide a registration API — registering a number is complex and requires a physical phone. You connect with already-registered credentials. See Mobile connections.
+QR or 8-character code — which should I use?
+
+Both work. QR is the default (auth_qr event). For an 8-character code, call client.auth.requestPairingCode(phone) after the auth_pairing_required event. See Authentication.
+logout() vs disconnect()
+
+disconnect() closes the socket but keeps credentials so you can resume later. logout() unlinks the device server-side and clears stored state (per logoutStoreClear). See Authentication.
+Handshake fails with HTTP 405 / failure_client_too_old
+
+WhatsApp rejected the bundled WA Web version. Upgrade zapo when possible. As a stopgap, set recoverFromClientTooOld: true to auto-fetch the current version and retry, or pass a version resolver that returns a fresh string per connect. See WhatsApp Web version.
+A business/newsletter operation throws
+
+Some operations are gated: editBusinessProfile, cover-photo ops, and broadcast lists are business-only; email binding is mobile-only; several community/newsletter ops require an active MEX transport. The coordinator reference flags each.
+​
+Still stuck?
+Architecture in depth
+Understand the layers to debug at the protocol level.
+Low-level API
+Inspect raw stanzas with the debug events and lowlevel.
+
+Recipes
+
+Copy-paste patterns for the most common things you’ll build with zapo — command bots, media handling, threaded replies, and group moderation tasks.
+
+Short, complete patterns built on the real API. They assume you already have a connected client — see the Quickstart for setup.
+​
+Extract text from any message
+Incoming text can arrive as a plain conversation or an extendedTextMessage (when it has a reply/preview). Normalize both:
+function getText(message: { conversation?: string | null; extendedTextMessage?: { text?: string | null } | null } | null | undefined) {
+  return message?.conversation ?? message?.extendedTextMessage?.text ?? undefined
+}
+​
+Command router
+Parse a leading /command and dispatch. Skip your own outgoing messages with event.key.fromMe:
+client.on('message', async (event) => {
+  if (event.key.fromMe) return // ignore our own sends (multi-device echo)
+  const text = getText(event.message)?.trim()
+  const to = event.key.remoteJid
+  if (!text || !text.startsWith('/') || !to) return
+
+  const [command, ...args] = text.slice(1).split(/\s+/)
+  switch (command) {
+    case 'ping':
+      await client.message.send(to, 'pong')
+      break
+    case 'echo':
+      await client.message.send(to, args.join(' ') || '(nothing to echo)')
+      break
+    default:
+      await client.message.send(to, `Unknown command: ${command}`)
+  }
+})
+​
+Reply with a quote and a mention
+client.on('message', async (event) => {
+  if (event.key.fromMe) return
+  const to = event.key.remoteJid
+  const sender = event.key.participant ?? event.key.remoteJid
+
+  await client.message.send(
+    to,
+    { type: 'text', text: 'got it 👍' },
+    { quote: event, mentions: sender ? [sender] : [] }
+  )
+})
+​
+Auto-download incoming media
+Stream straight to disk — never buffer large files in memory:
+client.on('message', async (event) => {
+  if (!event.message?.imageMessage) return
+  const file = `./media/${Date.now()}.jpg`
+  await client.message.downloadToFile(event, file)
+  console.log('saved', file)
+})
+See Media › Downloading incoming media for video/audio/documents and maxBytes.
+​
+Welcome new group members
+The group event fires on membership changes. Greet everyone added (action: 'add') and @-mention them:
+client.on('group', async (event) => {
+  if (event.action !== 'add' || !event.groupJid || !event.participants?.length) return
+
+  const jids = event.participants.map((p) => p.jid).filter((j): j is string => Boolean(j))
+  const mentions = jids.map((j) => `@${j.split('@')[0]}`).join(' ')
+
+  await client.message.send(
+    event.groupJid,
+    { type: 'text', text: `Welcome ${mentions}! 🎉` },
+    { mentions: jids }
+  )
+})
+​
+Send a poll
+await client.message.send(chatJid, {
+  type: 'poll',
+  name: 'Lunch?',
+  options: ['Pizza', 'Sushi', 'Salad'],
+  selectableCount: 1
+})
+​
+React to a message
+client.on('message', async (event) => {
+  if (event.key.fromMe) return
+  // Pass the event verbatim — its key is read for you.
+  await client.message.send(event.key.remoteJid, {
+    type: 'reaction',
+    emoji: '❤️',
+    target: event
+  })
+})
+​
+Keep the bot alive across drops
+zapo doesn’t auto-reconnect — wire the connection event to a backoff loop. The full pattern (including when not to reconnect) is in Reconnection and Errors & disconnects.
+Every snippet uses the content union — the same shapes client.message.send accepts everywhere. See Sending messages and the message types reference for the full set.
