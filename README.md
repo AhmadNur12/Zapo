@@ -3199,3 +3199,500 @@ const result = await client.broadcastList.send({
 console.log(result.id) // the published message id
 Each recipient is encrypted for individually (a fanout), so a single send call is effectively N direct sends behind one request. Pass the usual send options through options.
 Broadcast lists are not newsletters/channels: a broadcast reaches your existing contacts as private 1:1 messages, while a channel is a public, follower-based feed.
+
+
+Bots
+
+Discover WhatsApp bots, send prompts, and receive streamed responses with zapo. Works with any WhatsApp bot, including Meta AI and third-party agents.
+
+client.bot (WaBotCoordinator) works with WhatsApp bots - any account on the @bot domain. Meta AI is the most common one, but it is not the only bot; listBots() returns every bot available to your account. The coordinator discovers bots, reads their profiles, sends prompts, and decrypts the streamed chunks of a bot’s reply.
+​
+Discovering bots & getting a bot JID
+You don’t hard-code bot JIDs - you discover them with listBots() and pick one:
+const bots = await client.bot.listBots()
+// WaBotInfo[]: { jid, fbidJid, personaId, isDefault, section?, count? }
+
+// Pick the default bot (typically Meta AI), or choose another by section/name
+const bot = bots.find((b) => b.isDefault) ?? bots[0]
+const botJid = bot.jid // e.g. '13135550002@bot'
+
+// Inspect a bot's profile (commands, prompts, creator metadata)
+const profile = await client.bot.getBotProfile(botJid)
+// WaBotProfileResult | null: name, description, category, prompts, commands, creator…
+WaBotInfo.jid is the value you pass below as to (direct path) or options.botJid (mention path).
+​
+Sending a prompt
+sendPrompt(to, content, options?) invokes a bot. There are two paths depending on to:
+​
+Direct path — chat with the bot
+When to is a @bot JID, you’re chatting with the bot directly. zapo generates a fresh aiThreadId (a conversation id); reuse it on later prompts to keep context:
+// Start a conversation
+const first = await client.bot.sendPrompt(botJid, 'Explain WebSockets in one line')
+
+// Continue it — pass the same aiThreadId to keep context
+await client.bot.sendPrompt(botJid, 'Now in two lines', {
+  aiThreadId: myThreadId
+})
+​
+Mention path — invoke a bot inside a group
+When to is a group/chat JID, you must name the bot via options.botJid. The bot is invoked indirectly through a mention:
+// botJid comes from listBots() — see "Discovering bots" above
+await client.bot.sendPrompt(groupJid, '@MetaAI summarize the last messages', {
+  botJid,
+  extraMentionedJids: [] // optional extra mentions alongside the bot
+})
+On the mention path, aiThreadId / aiThreadType are ignored — bots drop the request if persona/thread metadata is attached to a mention.
+WaBotPromptOptions extends WaSendMessageOptions and adds botJid, personaId, capabilities, extraMentionedJids, aiThreadId, and aiThreadType.
+​
+Receiving the streamed reply
+A bot’s reply does not arrive as one message. It streams as multiple encrypted chunks, surfaced on the message_bot_chunk event. zapo decrypts them automatically on every incoming message, so you just listen:
+const buffers = new Map<string, string>()
+
+client.on('message_bot_chunk', (event) => {
+  // WaIncomingBotChunkEvent
+  const text = event.message?.conversation ?? ''
+
+  // Concatenate chunks in arrival order using editType
+  const prev = buffers.get(event.targetMessageId) ?? ''
+  buffers.set(event.targetMessageId, prev + text)
+
+  if (event.editType === 'last' || event.editType === 'full') {
+    console.log('full reply:', buffers.get(event.targetMessageId))
+    buffers.delete(event.targetMessageId)
+  }
+})
+The chunk event fields:
+Field	Meaning
+key.participant / key.remoteJid	The bot (sender = key.participant ?? key.remoteJid).
+targetMessageId	The id of the prompt this reply answers — your stream key.
+editType	Chunk position: first → inner → last, or a single full.
+message	The decrypted chunk content (Proto.IMessage).
+plaintext	Raw decrypted bytes.
+Reconstruct the full answer by concatenating chunks for a given targetMessageId in arrival order until you see last (or a single full).
+​
+Manual chunk decryption
+zapo calls tryDecryptChunk for you on each incoming message, so you rarely need it. If you manage incoming events yourself, you can invoke it explicitly:
+client.on('message', async (event) => {
+  await client.bot.tryDecryptChunk(event)
+})
+It silently no-ops when the chunk isn’t addressed to you or the parent prompt secret isn’t available.
+
+Presence & status
+
+Broadcast online presence, send typing and recording indicators, subscribe to contact presence, and post WhatsApp status updates with text and media.
+
+​
+Own presence
+Broadcast whether the account is online with client.presence.send:
+await client.presence.send('available')   // appears online
+await client.presence.send('unavailable') // appears offline
+The presence announced right after connecting is controlled by the markOnlineOnConnect option.
+​
+Typing indicators (chat-state)
+sendChatstate sends a per-chat hint such as typing or recording:
+// "typing…"
+await client.presence.sendChatstate(jid, { state: 'composing' })
+
+// "recording audio…"
+await client.presence.sendChatstate(jid, { state: 'recording' })
+
+// clear the indicator
+await client.presence.sendChatstate(jid, { state: 'paused' })
+A common pattern is to show typing briefly before replying:
+await client.presence.sendChatstate(jid, { state: 'composing' })
+await new Promise((r) => setTimeout(r, 1200))
+await client.message.send(jid, 'Done thinking!')
+await client.presence.sendChatstate(jid, { state: 'paused' })
+​
+Subscribing to a contact
+To receive a contact’s presence and chat-state, subscribe to them:
+await client.presence.subscribe(jid)
+
+client.on('presence', (event) => {
+  console.log(event.type, event.lastSeen)
+})
+
+client.on('chatstate', (event) => {
+  console.log(event.state, 'from', event.participantJid)
+})
+Subscriptions are per-JID and live only for the current connection. After a reconnect you must re-subscribe to keep receiving updates.
+​
+Status broadcasts
+Post a status (the “stories” feature) with client.status (WaStatusCoordinator). The content is the same content union as a normal message; you provide the recipient list:
+const result = await client.status.send({
+  content: 'Hello from my status!',
+  recipients: ['5511999999999@s.whatsapp.net', '5511888888888@s.whatsapp.net']
+})
+Media works too:
+await client.status.send({
+  content: { type: 'image', media: './story.jpg', mimetype: 'image/jpeg' },
+  recipients
+})
+​
+Status privacy & mute
+// Who can see your status
+await client.status.setPrivacy({ /* WaSetStatusPrivacyInput */ })
+
+// Mute a contact's status
+await client.status.setUserMuted(jid, true)
+
+// Revoke a status you posted
+await client.status.revokeStatus({ messageId, recipients })
+
+
+Profile, privacy & business
+
+
+Manage your WhatsApp profile, change privacy settings, edit the blocklist, and read business profiles and hours with the profile coordinator.
+
+​
+Profile
+client.profile (WaProfileCoordinator) reads and writes profile fields for your account and looks them up for others.
+​
+Profile picture
+import { readFile } from 'node:fs/promises'
+
+// Read someone's picture (or your own) — defaults to the low-res preview
+const pic = await client.profile.getProfilePicture(jid)
+
+// High-resolution original (the full-size avatar the user uploaded)
+const fullPic = await client.profile.getProfilePicture(jid, 'image')
+
+// Set your own
+await client.profile.setProfilePicture(await readFile('./avatar.jpg'))
+
+// Remove it
+await client.profile.deleteProfilePicture()
+getProfilePicture(jid, type?, existingId?) returns a WaProfilePictureResult — { url?, directPath?, id?, type? }. The second argument picks between the compact 'preview' variant (default) and the high-resolution 'image' original; both flavors are returned as the same envelope, only the bytes behind url / directPath differ. Pass the cached existingId to let the server short-circuit when the picture hasn’t changed (the result then comes back without the new url/directPath).
+​
+About / status text
+const about = await client.profile.getStatus(jid)
+await client.profile.setStatus('Available')
+​
+Push name
+pushName is the display name peers see for your account in chats and group participant lists. The change is applied to the local credentials immediately (so client.getCredentials()?.pushName reflects the new value right away) and is routed through an app-state mutation; peers see the new name on your next outgoing message.
+await client.profile.setPushName('Alice')
+Passing an empty string resets the name to the device fingerprint default.
+​
+Default disappearing mode
+setDisappearingMode sets the account-wide default lifetime applied to new 1:1 chats you start. Existing chats keep their per-chat setting.
+// 0 disables, 86400 = 24h, 604800 = 7d, 7776000 = 90d
+await client.profile.setDisappearingMode(604_800)
+
+// Disable
+await client.profile.setDisappearingMode(0)
+For per-group disappearing messages, see Groups → disappearing messages.
+​
+Batched lookups
+const profiles = await client.profile.getProfiles([jidA, jidB])
+const usernames = await client.profile.getUsernames([jidA, jidB])
+const modes = await client.profile.getDisappearingMode([jidA, jidB])
+​
+Check if a number is on WhatsApp
+Resolve phone numbers to their LID and learn whether each is registered on WhatsApp:
+const results = await client.profile.getLidsByPhoneNumbers(['+55 11 99999-9999'])
+// → [{ phoneJid: '5511999999999@s.whatsapp.net', lidJid: '…@lid', exists: true }]
+
+for (const r of results) {
+  if (r.exists) console.log(r.phoneJid, 'is on WhatsApp →', r.lidJid)
+}
+​
+Usernames
+const mine = await client.profile.getOwnUsername()
+const available = await client.profile.checkUsernameAvailability('myhandle')
+
+await client.profile.setUsername({ username: 'myhandle' })
+await client.profile.deleteUsername()
+setUsername, setUsernameKey, and resolveUsername all run the same local rules that WhatsApp applies (length, allowed characters, 4-digit key shape) and throw on failure before hitting the network — a call that returns without throwing has passed local validation, so setUsername returning false narrows the cause to a server-side outcome (taken, rate-limited).
+Resolve a handle to its LID with resolveUsername. The result is a discriminated union: 'found' gives you the JID (plus isBusiness / pnJid when applicable), 'key-required' means the server withheld the JID until you supply the 4-digit lookup key, and 'not-found' is terminal.
+// '@name' and a 'name:1234' key suffix in the handle are accepted
+let result = await client.profile.resolveUsername({ username: '@alice' })
+
+if (result.status === 'key-required') {
+  const usernameKey = await askUserForFourDigitKey() // your UI
+  result = await client.profile.resolveUsername({ username: '@alice', usernameKey })
+}
+
+if (result.status === 'found') {
+  console.log(result.jid, result.isBusiness, result.pnJid)
+} else if (result.status === 'not-found') {
+  console.log('no such handle')
+}
+​
+Privacy
+client.privacy (WaPrivacyCoordinator) controls privacy categories and the blocklist.
+​
+Privacy settings
+const settings = await client.privacy.getPrivacySettings()
+
+// Update a single setting
+const dhash = await client.privacy.setPrivacySetting('lastSeen', 'contacts')
+Setting names live on WA_PRIVACY_SETTING_TO_CATEGORY, allowed values per setting on WA_PRIVACY_SETTING_VALUES — every setting takes only the values WhatsApp Web accepts for it. The full list: lastSeen, online, profilePicture, about, readReceipts, groupAdd, callAdd, messages, defenseMode, linkedProfiles, pix.
+linkedProfiles controls who can see the Accounts Center profiles linked to this account. Takes the same visibility values as lastSeen / profilePicture ('all' | 'contacts' | 'contact_blacklist' | 'none'), deny-list included.
+pix controls who can see the Pix key on the profile (Brazil-only payments surface). Same visibility values as lastSeen.
+setPrivacySetting returns the dhash the server echoes back — the version stamp of that category’s disallowed list, present only while the category sits on 'contact_blacklist' (null otherwise). Setting a category to 'contact_blacklist' here only flips the mode; populate the list with setDisallowedList.
+​
+Blocklist
+const { jids, entries } = await client.privacy.getBlocklist()
+
+await client.privacy.blockUser(jid)
+await client.privacy.unblockUser(jid)
+WaBlocklistResult now carries entries: readonly WaPrivacyListEntry[] alongside jids — same membership, with a per-entry username?: string handle set only when the server identified the entry that way. block / unblock writes can address a migrated contact by username or display_name (the entry resolves through the same identifier lookup), instead of falling back to unknown_identifier.
+​
+Disallowed lists
+For settings scoped to a specific list of contacts (e.g. “share with everyone except…”):
+// Read the current deny-list for a category
+const { jids, dhash } = await client.privacy.getDisallowedList('lastSeen')
+
+// Populate or edit it (also switches the category to 'contact_blacklist')
+await client.privacy.setDisallowedList('lastSeen', {
+  add: ['5511999999999@s.whatsapp.net'],
+  remove: ['5511888888888@s.whatsapp.net']
+})
+setDisallowedList(category, input) carries the mode change and the entries in one stanza (the server has no separate deny-list endpoint). Inputs accept phone jids, LID jids, or bare phone numbers and are resolved to both addressing forms, the same way blockUser does. A migrated contact may be addressed by username or display_name (via the entry’s own identifier resolution) rather than falling back to unknown_identifier. The write is versioned by a dhash read right before sending; if another device mutated the list in between, the server answers 409 and the call refetches the stamp and retries once. The eligible categories are exposed as WA_PRIVACY_DISALLOWED_LIST_CATEGORIES (about, groupAdd, lastSeen, profilePicture, linkedProfiles, pix).
+WaPrivacyDisallowedListResult mirrors WaBlocklistResult: entries: readonly WaPrivacyListEntry[] accompanies jids with the same membership, adding a per-entry username?: string when the server identified the entry that way.
+​
+Reacting to changes on other devices
+A privacy change made on the primary (or another companion) surfaces on the privacy event with the full refreshed category set plus any disallowed list the server reported changed. The values come from a fresh read — never from the notification payload — and a burst of changes on the phone collapses into a single event, debounced 1s.
+client.on('privacy', (event) => {
+  console.log('privacy refreshed:', event.settings)
+  for (const list of event.disallowedLists) {
+    console.log(list.setting, 'deny-list:', list.jids)
+  }
+})
+
+// Same story for the blocklist
+client.on('blocklist', ({ jids }) => {
+  console.log('blocklist now', jids.length, 'entries')
+})
+Call client.privacy.refreshFromAccountSync() to force a refresh yourself — the result is both returned and re-emitted as the privacy event, so the client’s view stays consistent regardless of who triggered it. Concurrent calls are deduplicated.
+​
+Business
+client.business (WaBusinessCoordinator) reads business profiles and verified names, and manages your own business profile.
+Business account — required to edit your own profile or cover photo; the read methods work for any account.
+// Read business profiles (batched)
+const profiles = await client.business.getBusinessProfile([jidA, jidB])
+
+// Verified-name lookups
+const name = await client.business.getVerifiedName(jid)
+const names = await client.business.getVerifiedNames([jidA, jidB])
+
+// Edit your own business profile
+await client.business.editBusinessProfile({ /* WaEditBusinessProfileInput */ })
+
+// Cover photo
+await client.business.updateCoverPhoto(mediaSource)
+await client.business.deleteCoverPhoto(coverId)
+​
+Typed business hours
+WaBusinessHoursDay and WaBusinessHoursMode are union aliases ('sun' | 'mon' | …, 'open_24h' | 'specific_hours' | 'appointment_only'). The values are also frozen on WA_BUSINESS_HOURS_DAYS and WA_BUSINESS_HOURS_MODES. Passing an unknown mode to editBusinessProfile now throws a clear local error instead of the server replying with 406 not-acceptable — closed days are still expressed by omitting them from config, not by a dedicated mode.
+import { WA_BUSINESS_HOURS_DAYS, WA_BUSINESS_HOURS_MODES } from 'zapo-js'
+
+await client.business.editBusinessProfile({
+  businessHours: {
+    timezone: 'America/Sao_Paulo',
+    config: [
+      {
+        dayOfWeek: WA_BUSINESS_HOURS_DAYS.MON,
+        mode: WA_BUSINESS_HOURS_MODES.SPECIFIC_HOURS,
+        openTime: 540,  // minutes from midnight; 540 = 09:00
+        closeTime: 1080 // 18:00
+      },
+      { dayOfWeek: WA_BUSINESS_HOURS_DAYS.SAT, mode: WA_BUSINESS_HOURS_MODES.OPEN_24H }
+      // sun is closed — omit it
+    ]
+  }
+})
+​
+Chat settings
+Per-chat settings — mute, pin, archive, read, lock, star, clear, delete — live on client.chat and sync across your devices. They have their own guide:
+Managing chats
+Mute, pin, archive, mark read, lock, star messages, clear, and delete chats.
+
+Reconnection
+
+zapo does not auto-reconnect by design — follow this pattern to detect dropped sessions, rebuild the client, and resume without duplicate connections.
+
+WaClient does not reconnect automatically. This is a deliberate design choice: reconnection policy (backoff, max retries, alerting) belongs to your application. You listen for connection: close and decide what to do.
+​
+Internal recovery layers
+The “no auto-reconnect” rule applies to the session lifecycle: once a connection: close event fires, the client will not reopen by itself. Two lower-level retries do live inside the stack though – you will see them in logs and you do not need to handle them.
+WebSocket transport. If the socket drops before a successful noise handshake, WaComms retries internally every reconnectIntervalMs (default 2000) up to maxReconnectAttempts. Once the handshake completes, the counter resets and any subsequent drop surfaces as a connection event for your app to handle.
+Pairing transition. Right after a QR/code pair succeeds, the client restarts the socket as a registered session. No connection: close event fires for this – it is invisible from the outside.
+The client_too_old (HTTP 405) recovery covered below is a third, opt-in layer.
+​
+Connection lifecycle
+
+
+
+
+
+
+
+
+connect()
+
+opened
+
+failed
+
+connection close
+
+reconnect (isLogout = false)
+
+disconnect()
+
+isLogout = true (re-pair)
+
+Connecting
+
+Open
+
+Closed
+
+​
+The connection event
+connection is a discriminated union on status:
+client.on('connection', (event) => {
+  if (event.status === 'open') {
+    console.log('connected', { isNewLogin: event.isNewLogin })
+    return
+  }
+
+  // status === 'close'
+  console.log('disconnected', {
+    reason: event.reason,
+    code: event.code,
+    isLogout: event.isLogout
+  })
+})
+On close:
+isLogout: true — the device was unlinked (server-side logout). Do not reconnect; the credentials are gone and you must re-pair.
+isLogout: false — a transient drop. Safe to reconnect with the stored credentials.
+​
+A reconnection loop with backoff
+const MAX_ATTEMPTS = 10
+
+async function connectWithRetry(client: WaClient) {
+  let attempt = 0
+
+  client.on('connection', (event) => {
+    if (event.status === 'open') {
+      attempt = 0 // reset backoff on a healthy connection
+      return
+    }
+    if (event.isLogout) {
+      console.error('logged out — re-pairing required')
+      return
+    }
+    void reconnect()
+  })
+
+  async function reconnect() {
+    if (attempt >= MAX_ATTEMPTS) {
+      console.error('giving up after', attempt, 'attempts')
+      return
+    }
+    const delayMs = Math.min(30_000, 1_000 * 2 ** attempt)
+    attempt += 1
+    console.log(`reconnecting in ${delayMs}ms (attempt ${attempt})`)
+    await new Promise((r) => setTimeout(r, delayMs))
+    try {
+      await client.connect()
+    } catch (err) {
+      console.error('reconnect failed', err)
+      void reconnect()
+    }
+  }
+
+  await client.connect()
+}
+​
+Recovering from client_too_old (HTTP 405)
+If the server starts rejecting the noise handshake with failure_client_too_old, the bundled WA Web version is out of date. Two options:
+Set recoverFromClientTooOld: true on WaClient — on every 405 the client fetches the current version from web.whatsapp.com, swaps it in, and reconnects.
+Pass a version resolver that returns a fresh string per connect.
+Both are stopgaps — upgrade zapo when a release ships with a refreshed default.
+​
+After reconnecting
+Some state is connection-scoped and must be re-established after a successful reconnect:
+Presence subscriptions — re-subscribe() to any contacts you were watching (Presence).
+Newsletter live updates — re-subscribeLiveUpdates() if you rely on them.
+Persisted state (credentials, Signal sessions, app-state) is restored from the store automatically — you do not re-pair on a normal reconnect.
+​
+Graceful shutdown
+Call disconnect() for a clean shutdown that keeps credentials so you can resume later:
+process.on('SIGINT', async () => {
+  await client.disconnect()
+  process.exit(0)
+})
+This flushes pending write-behind data and closes the socket without unlinking the device.
+
+Errors & disconnects
+
+Read DisconnectReason codes, handle stream failures and error stanzas from WhatsApp, and decide when to reconnect versus stop the session for good.
+
+zapo surfaces problems through three event channels:
+connection with status: 'close' — the socket dropped, carrying a reason and optional code.
+stream_failure — a stream-level failure, often just before a close.
+stanza_error — a single request/stanza was rejected, without dropping the connection.
+For the reconnection loop itself (backoff, isLogout, graceful shutdown), see Reconnection. This page is about understanding why something failed.
+​
+Disconnect reasons
+The close event is { status: 'close', reason, code, isLogout }. reason is a WaDisconnectReason string; code is a numeric WaConnectionCode (or null). Use them to decide whether to reconnect:
+client.on('connection', (event) => {
+  if (event.status !== 'close') return
+  if (event.isLogout || isFatal(event.reason)) {
+    console.error('not reconnecting:', event.reason, event.code)
+    return
+  }
+  void reconnect() // see the Reconnection guide
+})
+
+const FATAL = new Set([
+  'stream_error_replaced',          // same credentials connected elsewhere
+  'stream_error_device_removed',    // device unlinked
+  'stream_error_force_logout',      // server forced logout (code 516)
+  'failure_not_authorized',         // 401
+  'failure_banned',                 // 406
+  'failure_locked',                 // 403
+  'failure_client_too_old',         // 405 — bump the advertised version
+  'failure_bad_user_agent',         // 409
+  'primary_identity_key_change'     // account identity changed — re-pair
+])
+const isFatal = (reason: string) => FATAL.has(reason)
+stream_error_force_login (code 515) is not fatal — it’s a routine “reconnect now” the server sends right after pairing and occasionally during a session. Just reconnect with the stored credentials.
+Transient reasons worth reconnecting on include stream_error_force_login, stream_error_ack, stream_error_xml_not_well_formed, stream_error_other, failure_service_unavailable, and comms_stopped. client_disconnected means you called disconnect() — expected, don’t reconnect.
+​
+Code reference
+When present, code (on the close event and on stream_failure.failureCode) is one of:
+Code	Meaning	Action
+401	Not authorized	Re-pair
+402	Temporarily banned	Back off hard
+403	Locked	Stop
+405	Client too old	Bump version
+406	Banned	Stop
+409	Bad user agent	Fix device fingerprint
+500	Internal server error	Retry later
+503	Service unavailable	Back off and retry
+515	Reconnect required	Reconnect now
+516	Forced logout	Re-pair (isLogout: true)
+The reason strings live in WA_DISCONNECT_REASONS and the 515/516 stream codes in WA_STREAM_SIGNALING, both exported from the package root. The numeric code values are typed as WaConnectionCode (also exported).
+​
+Stream failures
+stream_failure (WaIncomingFailureEvent) carries the raw failure detail and usually precedes a disconnect — log it for context:
+client.on('stream_failure', (event) => {
+  console.warn('stream failure', {
+    reason: event.failureReason,
+    code: event.failureCode,
+    message: event.failureMessage,
+    url: event.failureUrl
+  })
+})
+​
+Error stanzas
+stanza_error (WaIncomingErrorStanzaEvent) reports that a single stanza was rejected — for example a malformed query or a throttled request. The connection stays up:
+client.on('stanza_error', (event) => {
+  console.warn('stanza error', event.code, event.text)
+})
+A rejected client.message.send or client.lowlevel.query typically rejects its own promise too, so wrap individual calls in try/catch for per-operation handling; use stanza_error for visibility into errors that aren’t tied to a call you await.
