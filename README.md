@@ -4803,3 +4803,162 @@ lowlevel
 WaLowLevelCoordinator — full reference in Low-level API: sendNode, query, registerIncomingHandler, unregisterIncomingHandler, registerIncomingStanzaFilter.
 For top-level helpers exported from the package root — message inspection (getContentType), target normalization (resolveMessageTarget), JID predicates and constants — see JIDs, helpers & constants. For typed business hours, see Profile, privacy & business.
 
+Message types
+
+Every send content variant in zapo — the typed builders discriminated by type, and the raw Proto.IMessage fields the library recognizes on receive.
+
+Everything you send goes through client.message.send(to, content, options?). The content argument is a WaSendMessageContent:
+type WaSendMessageContent =
+  | string                        // shorthand for a text message
+  | WaSendTextMessage             // type: 'text'
+  | WaSendReactionMessage         // type: 'reaction'
+  | WaSendRevokeMessage           // type: 'revoke'
+  | WaSendPinMessage              // type: 'pin' | 'unpin'
+  | WaSendKeepMessage             // type: 'keep' | 'unkeep'
+  | WaSendPollMessage             // type: 'poll'
+  | WaSendPollVoteMessage         // type: 'poll-vote'
+  | WaSendEventMessage            // type: 'event'
+  | WaSendEventResponseMessage    // type: 'event-response'
+  | WaSendMediaMessage            // type: 'image' | 'video' | 'ptv' | 'audio' | 'document' | 'sticker' | 'sticker-pack'
+  | Proto.IMessage                // raw protobuf — anything not covered above
+There are two ways to send: a typed builder (an object with a type discriminator — the library validates and fills protocol fields for you) or a raw Proto.IMessage (you build the protobuf yourself). The same send() accepts both.
+​
+Shorthand
+A plain string is sent as a text message:
+await client.message.send(jid, 'Hello!')
+​
+Typed builders
+Each builder is discriminated by its type field. Bold fields are required.
+​
+Text & media
+type	Type	Required fields	Guide
+text	WaSendTextMessage	text	Sending messages
+image	WaSendMediaMessage	media (mimetype optional with a detectMimetype processor)	Media
+video	WaSendMediaMessage	media (mimetype optional with a detectMimetype processor)	Media
+ptv	WaSendMediaMessage	media (mimetype optional with a detectMimetype processor)	Media
+audio	WaSendMediaMessage	media (mimetype optional with a detectMimetype processor)	Media
+document	WaSendMediaMessage	media (mimetype optional with a detectMimetype processor)	Media
+sticker	WaSendMediaMessage	media (mimetype defaults to image/webp)	Media
+sticker-pack	WaSendStickerPackMessage	stickerPackId, name, publisher, stickers, trayIcon	Media
+Media builders also accept any non-managed field of the underlying protobuf message (e.g. caption, gifPlayback, ptt, fileName) via the UserMediaFields mapping. Protocol-managed fields (url, mediaKey, fileSha256, directPath, …) are filled by the builder.
+mimetype is optional. The resolution order is: an explicit mimetype you pass wins; otherwise the builder calls media.processor.detectMimetype (provided by @zapo-js/media-utils when file-type is installed); otherwise it throws for image/video/audio/document/ptv. Stickers default to image/webp.
+​
+Interactive
+type	Type	Required fields	Guide
+reaction	WaSendReactionMessage	emoji, target	Reactions
+poll	WaSendPollMessage	name, options	Polls
+poll-vote	WaSendPollVoteMessage	poll, selectedOptionNames	Voting
+event	WaSendEventMessage	name, startTime	Events
+event-response	WaSendEventResponseMessage	event, response	Event response
+pin / unpin	WaSendPinMessage	target (+ optional durationSecs)	Pinning
+keep / unkeep	WaSendKeepMessage	target	Keep-in-chat
+revoke	WaSendRevokeMessage	target	Revoking
+target is a WaMessageTargetInput — a WaMessageKey ({ remoteJid, id, fromMe, participant? }) or a received message event passed verbatim (its key is used). poll/event parents additionally require authorJid and the 32-byte messageSecret.
+For revoke, sender-vs-admin is auto-detected from target.fromMe (false triggers an admin revoke). There is no subtype option.
+​
+Raw Proto.IMessage
+For anything without a typed builder, pass a raw protobuf message. The library inspects the populated field and automatically resolves the stanza attributes — message type ([resolveMessageTypeAttr]), media type, polltype, event_type, view_once, and edit — so you only set the content field.
+import { proto } from 'zapo-js'
+
+await client.message.send(jid, {
+  conversation: 'A raw text message'
+})
+​
+Text
+Field	Notes
+conversation	Plain text.
+extendedTextMessage	Text with context (links, mentions, replies). A non-empty matchedText makes it a link/media message.
+​
+Media
+Field	Resolved media type
+imageMessage	image
+videoMessage	video (or gif when gifPlayback)
+ptvMessage	ptv
+audioMessage	audio (or ptt when ptt)
+documentMessage / documentWithCaptionMessage	document
+stickerMessage	sticker
+stickerPackMessage	sticker-pack
+Raw media fields require pre-uploaded media (the encryption keys, directPath, and digests must already be set). To upload from bytes/a file, use the typed media builders instead — they perform the upload for you.
+​
+Location & contacts
+// Static location
+await client.message.send(jid, {
+  locationMessage: { degreesLatitude: -23.55, degreesLongitude: -46.63, name: 'HQ' }
+})
+
+// Live location (resolved as `live-location`)
+await client.message.send(jid, {
+  liveLocationMessage: { degreesLatitude: -23.55, degreesLongitude: -46.63 }
+})
+
+// Single contact (vCard)
+await client.message.send(jid, {
+  contactMessage: { displayName: 'Maria', vcard: 'BEGIN:VCARD\n...\nEND:VCARD' }
+})
+
+// Multiple contacts
+await client.message.send(jid, {
+  contactsArrayMessage: { displayName: 'Team', contacts: [/* IContactMessage[] */] }
+})
+Field	Resolved media type
+locationMessage	location (or live-location when isLive)
+liveLocationMessage	live-location
+contactMessage	vcard
+contactsArrayMessage	contact_array
+​
+Interactive & business
+Field	Resolved type
+buttonsMessage	button
+buttonsResponseMessage	button_response
+listMessage	list
+listResponseMessage	list_response
+interactiveMessage (native flow)	interactive
+interactiveResponseMessage	native_flow_response
+templateButtonReplyMessage	text
+orderMessage	order
+productMessage	product
+groupInviteMessage	url
+await client.message.send(jid, {
+  groupInviteMessage: {
+    groupJid, inviteCode, inviteExpiration, groupName
+  }
+})
+​
+Polls & events (raw)
+Field	Resolved
+pollCreationMessage / …V2 / …V3 / …V5	poll (polltype: creation)
+pollUpdateMessage	poll (polltype: vote)
+pollResultSnapshotMessage	text
+eventMessage	event (event_type: creation)
+encEventResponseMessage	event (event_type: response)
+Poll creation and event messages auto-persist their messageSecret so later votes/responses can be encrypted.
+​
+Protocol, edits & system
+Field	Notes
+protocolMessage	Revokes (REVOKE), edits (MESSAGE_EDIT), ephemeral sync, welcome requests.
+editedMessage	Edited message wrapper (edit attr).
+reactionMessage / encReactionMessage	Reaction (type: reaction); empty text revokes.
+pinInChatMessage	Pin/unpin (edit: pin_in_chat).
+keepInChatMessage	Keep-in-chat.
+encCommentMessage	Comment on a message.
+requestPhoneNumberMessage	Request a phone number.
+newsletterAdminInviteMessage	Newsletter admin invite.
+secretEncryptedMessage	Carries secretEncType: EVENT_EDIT, POLL_EDIT, POLL_ADD_OPTION, MESSAGE_EDIT, MESSAGE_SCHEDULE.
+messageHistoryNotice / messageHistoryBundle	Group history sharing.
+​
+Wrappers
+These wrap an inner message; the library unwraps them when resolving attributes:
+ephemeralMessage, viewOnceMessage, viewOnceMessageV2, deviceSentMessage, groupMentionedMessage, botInvokeMessage, documentWithCaptionMessage.
+For view-once specifically, prefer the viewOnce send option over hand-wrapping.
+The full protobuf surface is available under the exported proto namespace — proto.Message, proto.Message.ProtocolMessage.Type, etc. Use it to build any field above and to reference enum values.
+​
+Raw proto cookbook
+Concrete client.message.send(jid, …) payloads for every raw kind live in the Raw proto sends guide. This reference only carries the type-mapping tables above; the guide has the send examples plus payment cards (PIX / review-and-pay).
+​
+Disappearing wrapper (ephemeralMessage)
+Wrap any message so it inherits the chat’s ephemeral timer. This is a wrapper mechanic — the inner message is what actually renders:
+await client.message.send(jid, {
+  ephemeralMessage: { message: { conversation: 'This disappears' } }
+})
+For the chat-wide ephemeral toggle (protocolMessage + EPHEMERAL_SETTING), see the guide’s Toggle disappearing messages section.
+
