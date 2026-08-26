@@ -4183,3 +4183,313 @@ client.on('message', async (event) => {
 Keep the bot alive across drops
 zapo doesn’t auto-reconnect — wire the connection event to a backoff loop. The full pattern (including when not to reconnect) is in Reconnection and Errors & disconnects.
 Every snippet uses the content union — the same shapes client.message.send accepts everywhere. See Sending messages and the message types reference for the full set.
+
+
+Voice calls (VoIP)
+
+
+Place and answer WhatsApp voice calls with @zapo-js/voip — a plugin that exposes a coordinator at client.voip, decodes inbound PCM, and lets you feed live outbound audio with backpressure.
+
+@zapo-js/voip is the official voice-calling plugin for zapo-js. It rides on the plugin system, exposes a WaVoipCoordinator at client.voip, and emits voip_* events on the host client.
+Only audio media is implemented. You may flag a call as video in the signaling (see CallOfferOptions.isVideo), but no video media is encoded or transported.
+​
+Install
+npm install @zapo-js/voip @roamhq/wrtc libmlow-wasm
+The package has three peer dependencies, all required at runtime:
+@roamhq/wrtc (>= 0.10.0) — provides SCTP for the relay transport.
+libmlow-wasm (^0.1.1) — WhatsApp’s Opus profile, compiled to WebAssembly. No native build step.
+zapo-js (^1.0.0) — the host client.
+Some methods also need an ffmpeg binary on PATH:
+loadAudio decodes the audio file via ffmpeg.
+Streaming audio with feedLiveAudio from a file likewise needs ffmpeg to produce 16 kHz mono Float32Array chunks.
+​
+Wire the plugin
+Add voipPlugin() to WaClientOptions.plugins. The coordinator appears at client.voip and the voip_* events become available on client.on.
+import { WaClient } from 'zapo-js'
+import { voipPlugin } from '@zapo-js/voip'
+
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  plugins: [voipPlugin()]
+}, logger)
+
+await client.connect()
+
+client.on('voip_call_incoming', (call) => {
+  console.log('incoming', call.callId, 'from', call.peerJid)
+})
+​
+Plugin options
+voipPlugin({ maxConcurrentCalls: 2, logLevel: 'warn' })
+​
+maxConcurrentCalls
+numberdefault:"1"
+Maximum simultaneous non-ended calls (ringing, connecting, or active). Increase to enable parallel multi-call. Outgoing startCall rejects, and incoming calls arrive with acceptBlocked: true, when the limit is hit.
+​
+logLevel
+LogLevel
+Minimum log level for the (chatty) VoIP plugin. Defaults to the host client’s level; set it to cap diagnostics independently — for example 'warn' to keep VoIP noise out of a trace host logger.
+​
+The coordinator surface
+​
+Placing a call
+const callId = await client.voip.startCall({
+  peerJid: '5511999999999@s.whatsapp.net'
+})
+​
+peerJid
+stringrequired
+Bare or device JID to call.
+​
+isVideo
+booleandefault:"false"
+Flag the call as video in the signaling stanzas. Video media encode/transport is not implemented; only audio media flows.
+​
+audioFile
+string
+Audio file to preload and play once the call connects (needs ffmpeg). Equivalent to calling loadAudio after the call goes active.
+​
+peerDevices
+string[]
+Explicit peer device JIDs to ring; omit to resolve them automatically.
+startCall resolves with the new call id once the offer is sent. Progress then arrives via voip_call_state. It rejects when you’re at the maxConcurrentCalls limit or if the offer fails to send.
+​
+Answering and ending
+await client.voip.acceptCall(callId)
+await client.voip.rejectCall(callId)          // EndCallReason.Declined
+await client.voip.endCall(callId)             // EndCallReason.UserEnded
+await client.voip.endCall(callId, EndCallReason.Busy)
+acceptCall(callId) — accept a ringing incoming call. Throws if callId is unknown or not in an acceptable state.
+rejectCall(callId, reason?) — reject a ringing incoming call (default reason Declined). Sends the reject stanza, then tears the call down.
+endCall(callId, reason?) — end an active or connecting call (default reason UserEnded). No-op if the call is unknown or already ended.
+​
+Preloaded outbound audio
+await client.voip.loadAudio(callId, './hello.mp3')
+Decodes audioPath via ffmpeg and queues it as the outbound audio, played once the call is active. Throws if the file is missing or ffmpeg is unavailable.
+For an unbounded or live source (TTS stream, ongoing capture) use external audio mode instead — see below.
+​
+Mute
+client.voip.setMute(callId, true)   // mute local outbound audio
+client.voip.setMute(callId, false)  // unmute
+​
+Live outbound audio (external mode)
+For sources you can’t preload — streaming TTS, real-time capture — switch the call into external audio mode and pump samples in as they arrive. The plugin buffers them through a bounded jitter buffer and watermarks the buffer so a respectful producer never loses audio.
+client.voip.setExternalAudioMode(callId, true)
+
+const { pauseMs, resumeMs } = client.voip.getFeedWatermarksMs()
+
+// later, repeatedly:
+const bufferedMs = client.voip.feedLiveAudio(callId, samples) // Float32Array, 16 kHz mono
+if (bufferedMs >= pauseMs) {
+  // back off until getLiveBufferMs(callId) <= resumeMs
+}
+Method	Returns	What it does
+setExternalAudioMode(callId, enabled)	void	Switch outbound audio source between preloaded playback and the live feed. Disable to return to preloaded playback.
+feedLiveAudio(callId, data)	number	Feed a chunk of mono PCM (Float32Array at the engine sample rate). Returns the audio currently buffered ahead of the sender in milliseconds, so a producer can pace itself. Returns 0 when no session exists. The buffer is bounded and drops the oldest samples on overflow.
+getLiveBufferMs(callId)	number	Milliseconds of live audio currently buffered ahead of the sender. 0 when no session exists or external mode is off.
+getFeedWatermarksMs()	{ pauseMs, resumeMs }	Backpressure watermarks for the live feed, in milliseconds. Constants of the feed contract, independent of any specific call.
+The watermark contract: pause feeding once getLiveBufferMs(callId) >= pauseMs, resume once it drains back to resumeMs. pauseMs stays below the engine’s internal drop threshold, so a producer that respects it never loses audio. If you ignore it, oldest samples are dropped on overflow.
+​
+Snapshots
+const call = client.voip.getCall(callId)   // CallInfo | null
+const all  = client.voip.getCalls()        // readonly CallInfo[]
+CallInfo captures everything you need to render UI: callId, peerJid, direction, mediaType, createdAt, callerPn, plus a stateData object (state, audioMuted, videoOff, connectedAt, endReason, durationSecs, acceptBlocked, …) and derived getters isInitiator, isActive, isRinging, isEnded, canAccept, canReject, isAcceptBlocked.
+​
+Events
+Add voipPlugin() to plugins and these events become available on client.on. Without the plugin they don’t exist on the type — see Plugins.
+Event	Payload	Description
+voip_call_state	CallInfo	The call’s state transitioned (ringing, connecting, active, on_hold, ended, …).
+voip_call_incoming	CallInfo	A new incoming call.
+voip_call_ended	CallInfo	The call ended (any reason).
+voip_call_inbound_audio	{ call, pcm }	Decoded peer audio. pcm is 16 kHz mono Float32Array.
+voip_call_outbound_audio_finished	CallInfo	The preloaded outbound audio finished sending.
+voip_call_error	Error	A non-fatal call error (logging hook).
+​
+Enums
+All enum values are lowercase strings — use the enum constants to avoid typos.
+​
+CallState
+Constant	String value
+CallState.Initiating	'initiating'
+CallState.Ringing	'ringing'
+CallState.IncomingRinging	'incoming_ringing'
+CallState.Connecting	'connecting'
+CallState.Active	'active'
+CallState.OnHold	'on_hold'
+CallState.Ended	'ended'
+​
+CallDirection
+Constant	String value
+CallDirection.Outgoing	'outgoing'
+CallDirection.Incoming	'incoming'
+​
+CallMediaType
+Constant	String value
+CallMediaType.Audio	'audio'
+CallMediaType.Video	'video'
+​
+EndCallReason
+Constant	String value
+EndCallReason.UserEnded	'user_ended'
+EndCallReason.Declined	'declined'
+EndCallReason.Timeout	'timeout'
+EndCallReason.Busy	'busy'
+EndCallReason.Cancelled	'cancelled'
+EndCallReason.Failed	'failed'
+EndCallReason.DoNotDisturb	'do_not_disturb'
+EndCallReason.Unknown	'unknown'
+​
+Audio format
+Sample rate: 16 kHz.
+Channels: mono.
+Sample format: Float32Array in [-1.0, 1.0].
+Codec on the wire: WhatsApp’s Opus profile, encoded via libmlow-wasm. The RTP payload type is 120 (PayloadType.WhatsAppOpus).
+Both inbound (voip_call_inbound_audio) and outbound (feedLiveAudio) are this same Float32Array shape — keep your buffers in this format and you can route them straight through.
+​
+Worked example
+A minimal incoming auto-accept that records inbound PCM into an in-memory buffer:
+import { WaClient, createPinoLogger } from 'zapo-js'
+import { CallState, voipPlugin } from '@zapo-js/voip'
+
+const logger = await createPinoLogger({ level: 'info' })
+
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  plugins: [voipPlugin({ maxConcurrentCalls: 1 })]
+}, logger)
+
+const recordings = new Map<string, Float32Array[]>()
+
+client.on('voip_call_incoming', async (call) => {
+  if (!call.canAccept) return
+  await client.voip.acceptCall(call.callId)
+  recordings.set(call.callId, [])
+})
+
+client.on('voip_call_inbound_audio', ({ call, pcm }) => {
+  // pcm is 16 kHz mono Float32Array
+  const buffer = recordings.get(call.callId)
+  if (buffer) buffer.push(pcm.slice())
+})
+
+client.on('voip_call_state', (call) => {
+  if (call.stateData.state === CallState.Active) {
+    console.log(`call ${call.callId} active`)
+  }
+})
+
+client.on('voip_call_ended', (call) => {
+  const chunks = recordings.get(call.callId) ?? []
+  const total = chunks.reduce((n, c) => n + c.length, 0)
+  console.log(`call ${call.callId} ended; recorded ${total} samples`)
+  recordings.delete(call.callId)
+})
+
+await client.connect()
+For a fuller example — placing outgoing calls, preloaded vs streamed playback, hangup-after-audio, WAV recording — see examples/voip-example.ts in the zapo source tree.
+​
+
+WAM telemetry (analytics parity)
+
+Emit the client-side w:stats telemetry batches a real WhatsApp Web tab sends, for wire parity and anti-fingerprinting — via the @zapo-js/wam plugin.
+
+@zapo-js/wam is an optional plugin that sends the client-side WAM (w:stats) telemetry batches a real WhatsApp Web client sends after login. This is a parity improvement, not observability for your own code: WAM is WhatsApp’s internal analytics stream, and mirroring its shape reduces the chance a headless session stands out compared to a real Web tab.
+You do not need this plugin to send or receive messages, place calls, or use any coordinator. Install it only when you want the session’s wire footprint to include the analytics WA Web tabs emit — for anti-fingerprinting purposes.
+​
+Install
+npm install @zapo-js/wam
+The only peer dependency is zapo-js (^1.5.0). The WAM event registry and wire encoder (@vinikjkkj/wa-wam) is pinned as a regular dependencies entry on the plugin, so it comes down transitively — no need to install it explicitly.
+​
+Wire the plugin
+Add wamPlugin() to WaClientOptions.plugins. A WaWamCoordinator appears at client.wam and — by default — a full telemetry pipeline runs in the background.
+import { WaClient } from 'zapo-js'
+import { wamPlugin } from '@zapo-js/wam'
+
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  plugins: [wamPlugin()]
+}, logger)
+
+await client.connect()
+That’s the whole integration in the common case. The plugin observes the host client, commits protocol events as they happen, and fabricates plausible UI telemetry on the side.
+​
+Plugin options
+Every option is optional; each falls back to a value that matches (or closely tracks) what a real WA Web client uses.
+​
+logLevel
+LogLevel
+Minimum log level for the WAM plugin. Defaults to the host client’s.
+​
+flushIntervalMs
+numberdefault:"5000"
+Coalesce window before a non-empty buffer flushes. Matches WA_WAM_BUFFER_CONSTANTS.inMemoryBufferingDurationSecs when available.
+​
+maxBufferSize
+numberdefault:"50000"
+Byte size that forces an immediate flush of a channel’s batch, ahead of the interval. Matches WA_WAM_BUFFER_CONSTANTS.maxBufferSize when available.
+​
+appVersion
+string
+Overrides the advertised app version. Defaults to the bundled WA_VERSION.
+​
+serviceImprovementOptOut
+booleandefault:"false"
+The service_improvement_opt_out consent bit stamped on outgoing batches. Leave at false for parity with a default WA Web tab.
+​
+autoEmit
+booleandefault:"true"
+When true, the plugin observes the host client (frames, connection events, sends) and commits the matching protocol events itself. Set to false to drive client.wam.commit(...) entirely on your own.
+​
+syntheticUi
+boolean | WaWamSyntheticUiOptionsdefault:"true"
+Fabricates plausible UI (UiAction) telemetry — chat opens, image opens, audio media loads, info-drawer opens, attachment-tray sends, ambient re-opens, and periodic MemoryStat samples — so the event profile mimics a human WA Web session. Everything is jittered and rate-limited; a badly-timed fabrication is a worse tell than none. Pass false to disable, or an options object (WaWamSyntheticUiOptions) to tune per-event probabilities (chatOpenProbability, imageOpenProbability, audioLoadProbability, infoOpenProbability, attachmentTrayProbability, aboutConsumptionProbability), ambient / memory-sample intervals, an active-hour window, and per-surface capability gates (channels, communities, business — all default false; enable only when the session genuinely has that surface, since firing a channel/community/business event on an account that lacks it is itself a tell).
+​
+Events emitted
+The plugin covers 131 of the registry’s 426 events (~31%). The rest is data a headless client cannot produce or plausibly fake — browser/runtime internals, device and OS state, mobile-app-only flows, crypto internals, ads, server-side aggregates — plus events carried on the private (non-w:stats) channels.
+The 131 come from two independently toggled sources:
+Source	Flag	Default	Count
+Protocol lifecycle	autoEmit	on	19
+Integrator actions	autoEmit	on	18
+Synthetic UI	syntheticUi	on	94
+Protocol lifecycle (19)
+
+Integrator actions (18)
+
+Synthetic UI (94)
+
+Two disciplines keep the emitted set a faithful fingerprint. Auto-emitted protocol and integrator events fire only when every field is honestly derivable from real client activity. Synthetic UI events are fabricated but each replicates WA Web’s actual emit — verified against the deobfuscated web bundle — jittered, rate-limited, and confined to configurable active hours.
+​
+client.wam
+The coordinator exposes three methods.
+Method	Signature	Description
+commit	<K>(name: K, payload?: WaWamEventArgs<K>) => void	Commit one WAM event into the current channel’s batch. The event is dropped by the same Math.random() * weight > 1 sampling gate WA applies (and dropped silently if the event name is unknown).
+flush	() => Promise<void>	Flush every open batch immediately.
+dispose	() => Promise<void>	Stop accepting new events, tear down autoEmit and syntheticUi, and flush what’s left. Called automatically when the plugin disposes on disconnect().
+// Commit an event manually (autoEmit does most of these for you)
+client.wam.commit('UiAction', { uiActionType: 'CHAT_OPEN' })
+Batches only upload while the client is connected and the account has finished registering (credentials.meJid populated). A batch produced while offline, or during the pre-login window on a fresh pair, is dropped on flush — the plugin logs a trace and moves on. Once the session is fully logged in, future batches upload normally.
+​
+What the pipeline does
+autoEmit subscribes to the host client’s protocol surface and commits the corresponding WAM events as they occur — this is what makes the “install it and forget” default work.
+syntheticUi watches the same surface and fabricates human-scale UI events on the side (chat opens on inbound messages, occasional info-drawer opens, ambient re-opens between activity spikes). Time-of-day and per-event probabilities are tunable; capability gates default to off, so nothing channel/community/business-specific fires unless you turn it on.
+Both are on by default. Set either to false to opt out.
+​
+Worked example
+Install the plugin and let the defaults do everything — this is the intended common case:
+import { WaClient } from 'zapo-js'
+import { wamPlugin } from '@zapo-js/wam'
+
+const client = new WaClient({
+  store,
+  sessionId: 'main',
+  plugins: [wamPlugin()]
+}, logger)
+
+await client.connect()
+// telemetry batches now flush every ~5s while connected
+For a headless bot that never opens chats, disable the synthetic UI so the profile matches the real behavior (a bot that hammers send without ever “opening” a chat is itself a signal):
+plugins: [wamPlugin({ syntheticUi: false })]
+​
