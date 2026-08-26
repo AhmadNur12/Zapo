@@ -2015,3 +2015,520 @@ await client.message.send(jid, {
 })
 Content types without a typed builder yet — locations, contact vCards, and Business PIX / review-and-pay payment cards — are documented in Raw proto sends.
 The full set of recognized Proto.IMessage fields (location, live location, contacts, group invite, product, order, …) is listed in the message types reference.
+
+
+Raw proto sends
+
+Send content types WhatsApp supports but zapo doesn’t have a typed builder for yet — locations, contact vCards, group invites, buttons, list menus, interactive native flow, products, orders, newsletter admin invites, ephemeral toggles, phone-number requests, and Business PIX / review-and-pay payment cards — as raw Proto.IMessage payloads.
+
+For content types WhatsApp supports but zapo doesn’t wrap in a typed builder yet, client.message.send also accepts a raw Proto.IMessage. Fill the field that names the content type — locationMessage, contactMessage, contactsArrayMessage, interactiveMessage, and so on — and the library encodes it verbatim.
+Kinds that already have a typed builder — polls, reactions, edits, revokes, pins, keep-in-chat, view-once wrapping, and quotes / mentions / link previews — belong in Sending messages and Interactive messages. This page is for the raw-only kinds.
+The full set of recognized Proto.IMessage fields (location, live location, contacts, group invite, product, order, …) is listed in the message types reference. Some examples below use enum values from the proto namespace:
+import { proto } from 'zapo-js'
+​
+Locations
+await client.message.send(jid, {
+  locationMessage: {
+    degreesLatitude: -23.5613,
+    degreesLongitude: -46.6565,
+    name: 'Av. Paulista',
+    address: 'São Paulo, BR'
+  }
+})
+name and address are optional.
+For a live-location message, use the liveLocationMessage field instead — it carries movement metadata (accuracyInMeters, speedInMps, sequenceNumber).
+await client.message.send(jid, {
+  liveLocationMessage: {
+    degreesLatitude: -23.5505,
+    degreesLongitude: -46.6333,
+    accuracyInMeters: 50,
+    speedInMps: 0,
+    caption: 'On my way',
+    sequenceNumber: 1
+  }
+})
+​
+Contacts
+A single contact card is a contactMessage with a vCard string:
+const vcard = [
+  'BEGIN:VCARD',
+  'VERSION:3.0',
+  'FN:Jeff Singh',
+  'TEL;type=CELL;type=VOICE;waid=5511999999999:+55 11 99999-9999',
+  'END:VCARD'
+].join('\n')
+
+await client.message.send(jid, {
+  contactMessage: { displayName: 'Jeff', vcard }
+})
+The waid=<digits> parameter on the TEL line is what lets the WhatsApp client link the card back to a WhatsApp account — use the recipient’s E.164 phone number without the +.
+For multiple cards at once, use contactsArrayMessage:
+await client.message.send(jid, {
+  contactsArrayMessage: {
+    displayName: '2 contacts',
+    contacts: [
+      { displayName: 'Jeff', vcard },
+      { displayName: 'Jane', vcard: janeVcard }
+    ]
+  }
+})
+​
+Group invite
+await client.message.send(jid, {
+  groupInviteMessage: {
+    groupJid: '123456789-987654@g.us',
+    inviteCode: 'AbCdEf123',
+    inviteExpiration: Math.floor(Date.now() / 1000) + 86_400,
+    groupName: 'My group',
+    caption: 'Join us!'
+  }
+})
+​
+Buttons
+Up to three quick-reply buttons. The header is a oneof — pick text, image, video, location, or document (pre-uploaded for media):
+await client.message.send(jid, {
+  buttonsMessage: {
+    contentText: 'Order placed — what next?',
+    footerText: 'Reply within 24h',
+    headerType: proto.Message.ButtonsMessage.HeaderType.TEXT,
+    text: 'Order #1234',
+    buttons: [
+      {
+        buttonId: 'track',
+        buttonText: { displayText: 'Track' },
+        type: proto.Message.ButtonsMessage.Button.Type.RESPONSE
+      },
+      {
+        buttonId: 'cancel',
+        buttonText: { displayText: 'Cancel' },
+        type: proto.Message.ButtonsMessage.Button.Type.RESPONSE
+      }
+    ]
+  }
+})
+​
+List menu
+A single-select list of rows grouped into sections:
+await client.message.send(jid, {
+  listMessage: {
+    title: 'Menu',
+    description: 'Choose an item',
+    buttonText: 'View menu',
+    footerText: 'Open 9–18',
+    listType: proto.Message.ListMessage.ListType.SINGLE_SELECT,
+    sections: [
+      {
+        title: 'Pizzas',
+        rows: [
+          { rowId: 'pizza-margherita', title: 'Margherita', description: 'Tomato, mozzarella, basil' },
+          { rowId: 'pizza-pepperoni',  title: 'Pepperoni',  description: 'Tomato, cheese, pepperoni' }
+        ]
+      },
+      {
+        title: 'Drinks',
+        rows: [{ rowId: 'drink-cola', title: 'Cola' }]
+      }
+    ]
+  }
+})
+​
+Interactive native flow (cta_url)
+The modern interactive surface — buttons whose params are JSON-encoded ad-hoc payloads:
+await client.message.send(jid, {
+  interactiveMessage: {
+    body: { text: 'Tap below to open the form' },
+    footer: { text: 'Powered by your bot' },
+    nativeFlowMessage: {
+      buttons: [
+        {
+          name: 'cta_url',
+          buttonParamsJson: JSON.stringify({
+            display_text: 'Open form',
+            url: 'https://example.com/form'
+          })
+        }
+      ],
+      messageVersion: 1
+    }
+  }
+})
+This is the same wire shape as the PIX / review-and-pay cards in Payments below — only the button name and buttonParamsJson differ.
+​
+Product
+Send a catalog product. The inner productImage must already be uploaded:
+await client.message.send(jid, {
+  productMessage: {
+    businessOwnerJid: '5511999999999@s.whatsapp.net',
+    body: 'Take a look at this',
+    footer: 'In stock',
+    product: {
+      productId: '12345',
+      title: 'Hat',
+      description: 'One size, adjustable',
+      currencyCode: 'BRL',
+      priceAmount1000: 49_900, // 49.90 BRL — price × 1000
+      retailerId: 'sku-001',
+      url: 'https://example.com/p/12345',
+      productImage: { /* pre-uploaded image fields */ }
+    }
+  }
+})
+​
+Order
+Order confirmation / inquiry:
+await client.message.send(jid, {
+  orderMessage: {
+    orderId: 'ord-abc',
+    orderTitle: 'Sample order',
+    itemCount: 3,
+    status: proto.Message.OrderMessage.OrderStatus.INQUIRY,   // or ACCEPTED / DECLINED
+    surface: proto.Message.OrderMessage.OrderSurface.CATALOG,
+    sellerJid: '5511888888888@s.whatsapp.net',
+    totalAmount1000: 149_700, // 149.70 BRL — total × 1000
+    totalCurrencyCode: 'BRL',
+    message: 'Order details'
+  }
+})
+​
+Newsletter admin invite
+Invite a contact to co-admin one of your newsletters:
+await client.message.send(contactJid, {
+  newsletterAdminInviteMessage: {
+    newsletterJid: '120363xxxxxxxxxxxxxx@newsletter',
+    newsletterName: 'My Newsletter',
+    caption: 'Become a co-admin',
+    inviteExpiration: Math.floor(Date.now() / 1000) + 7 * 86_400
+  }
+})
+​
+Toggle disappearing messages (ephemeral setting)
+Chat-wide toggle for disappearing messages — distinct from the per-message expirationSeconds send option (one message) and the ephemeralMessage wrapper (one message inheriting the chat timer). This one flips the timer for the whole chat.
+await client.message.send(jid, {
+  protocolMessage: {
+    type: proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
+    ephemeralExpiration: 7 * 24 * 3600 // seconds; 0 disables
+  }
+})
+​
+Request a phone number
+await client.message.send(jid, { requestPhoneNumberMessage: {} })
+​
+Payments (PIX & review-and-pay)
+Send WhatsApp Business payment cards — static PIX (payment_info) and order checkout (review_and_pay) — as raw interactiveMessage / nativeFlowMessage payloads through client.message.send. There is no typed builder for them yet, so build the shape yourself the same way as the locations/contacts cards above. The library relays the interactive native-flow buttons; the WhatsApp clients render the card UI.
+Payment cards are a Business / native-flow feature. Rendering differs between WhatsApp mobile and WhatsApp Web — prefer the flow that matches the UI you want (payment_info for a PIX-only card, review_and_pay for the “Nº da cobrança” / order card) and verify on both clients.
+Amounts are integer minor units plus an offset divisor: { value: 1000, offset: 100 } renders as R$ 10,00. PIX key_type is one of EVP (chave aleatória), EMAIL, PHONE (E.164 preferred), CPF, CNPJ.
+​
+PIX card (payment_info)
+Renders the PIX payment card (key / merchant). Use this for a static PIX key without an order card.
+await client.message.send(jid, {
+  interactiveMessage: {
+    nativeFlowMessage: {
+      messageVersion: 1,
+      buttons: [
+        {
+          name: 'payment_info',
+          buttonParamsJson: JSON.stringify({
+            currency: 'BRL',
+            total_amount: { value: 0, offset: 100 },
+            reference_id: `PIX${Date.now()}`,
+            type: 'physical-goods',
+            order: {
+              status: 'pending',
+              subtotal: { value: 0, offset: 100 },
+              order_type: 'ORDER',
+              items: [
+                { name: '', amount: { value: 0, offset: 100 }, quantity: 0, sale_amount: { value: 0, offset: 100 } }
+              ]
+            },
+            payment_settings: [
+              {
+                type: 'pix_static_code',
+                pix_static_code: {
+                  merchant_name: 'Loja Exemplo',
+                  key: 'pix@loja.com',
+                  key_type: 'EMAIL'
+                }
+              }
+            ],
+            share_payment_status: false,
+            is_soft_deleted: false,
+            referral: 'chat_attachment'
+            // display_text: 'Pagar com PIX' // optional
+          })
+        }
+      ]
+    }
+  }
+})
+​
+Review-and-pay card (review_and_pay)
+Renders the order / cobrança card (reference number, items, total). Use this for a checkout-style summary.
+await client.message.send(jid, {
+  interactiveMessage: {
+    body: { text: 'Olá! Sua fatura está disponível.' },
+    footer: { text: 'Se já pagou, desconsidere.' },
+    nativeFlowMessage: {
+      messageVersion: 1,
+      buttons: [
+        {
+          name: 'review_and_pay',
+          buttonParamsJson: JSON.stringify({
+            currency: 'BRL',
+            reference_id: 'PGT-PIX-001',
+            type: 'physical-goods',
+            total_amount: { value: 10000, offset: 100 }, // R$ 100,00
+            payment_settings: [
+              {
+                type: 'pix_static_code',
+                pix_static_code: {
+                  merchant_name: 'Loja Exemplo',
+                  key: 'pix@loja.com',
+                  key_type: 'EMAIL'
+                }
+              }
+            ],
+            order: {
+              status: 'payment_requested',
+              subtotal: { value: 10000, offset: 100 },
+              order_type: 'ORDER',
+              items: [
+                { name: 'Fatura', amount: { value: 10000, offset: 100 }, quantity: 1 }
+              ]
+              // discount: { value: 500, offset: 100 }
+            }
+            // additional_note: 'Pagamento até o vencimento'
+          })
+        }
+      ]
+    }
+  }
+})
+buttonParamsJson must be a JSON string — build the object in code and stringify it. body / footer on interactiveMessage are optional. Don’t mix payment_info and review_and_pay expecting the same UI — they render different cards, and adding extra cta_copy / CTA buttons in the same nativeFlowMessage can render differently on mobile vs Web.
+​
+See also
+Sending messages — the base client.message.send API, options, and typed content variants.
+Interactive messages — typed builders for polls, reactions, edits, revokes, pins, and keep-in-chat.
+Message types reference — every recognized Proto.IMessage field and its resolved type.
+
+Media
+
+Send images, video, audio voice notes, documents, and stickers — and stream or download incoming WhatsApp media attachments with zapo’s media helpers.
+
+Media is sent through the same client.message.send method, using a typed media content object. The builder fills in the protocol-managed fields (encryption keys, SHA-256 digests, direct path, upload) for you — you provide the source and, optionally, a mimetype.
+For usable media, install @zapo-js/media-utils and wire a processor through the media client option. Media still uploads without it, but without a processor it has no thumbnail/preview, dimensions, or waveform — so it may arrive as a plain attachment.
+​
+Mimetype resolution
+mimetype is optional. The builder resolves it in this order:
+The mimetype you pass on the content object wins.
+If a WaMediaProcessor with detectMimetype is configured, the builder calls it (sniffing magic bytes). @zapo-js/media-utils implements this on top of file-type ^19 — install file-type to enable detection.
+Otherwise the builder throws for image/video/audio/document/ptv messages.
+Stickers default to image/webp when no mimetype is set. Readable stream inputs with no mimetype are staged to a temp file before detection runs.
+​
+Media input
+The media field accepts several input types:
+type MediaInput = Uint8Array | ArrayBuffer | Readable | string
+Prefer a file path (string) or a Readable stream over a Buffer/Uint8Array. zapo streams media through the pipeline without buffering the whole file in memory — passing a path or stream keeps memory flat regardless of file size. Reading a large file into a Buffer first defeats that and is discouraged. (Buffer is also avoided internally in favor of Uint8Array.)
+​
+Images
+// Preferred — pass a file path; zapo streams it
+await client.message.send(jid, {
+  type: 'image',
+  media: './photo.jpg',
+  mimetype: 'image/jpeg',
+  caption: 'A photo'
+})
+
+// Or a Readable stream (e.g. from an HTTP response)
+import { createReadStream } from 'node:fs'
+
+await client.message.send(jid, {
+  type: 'image',
+  media: createReadStream('./photo.jpg'),
+  mimetype: 'image/jpeg'
+})
+​
+Video
+await client.message.send(jid, {
+  type: 'video',
+  media: './clip.mp4',
+  mimetype: 'video/mp4',
+  caption: 'A clip',
+  gifPlayback: false
+})
+For a round push-to-video (PTV) message, use type: 'ptv' with the same shape.
+​
+Audio & voice notes
+// Regular audio
+await client.message.send(jid, {
+  type: 'audio',
+  media: './song.mp3',
+  mimetype: 'audio/mpeg'
+})
+
+// Voice note (push-to-talk)
+await client.message.send(jid, {
+  type: 'audio',
+  media: './voice.ogg',
+  mimetype: 'audio/ogg; codecs=opus',
+  ptt: true
+})
+Voice notes render best as Opus in an OGG container. Enable media processing to auto-generate waveforms and normalize voice notes.
+​
+Documents
+await client.message.send(jid, {
+  type: 'document',
+  media: './report.pdf',
+  mimetype: 'application/pdf',
+  fileName: 'Q3 Report.pdf',
+  caption: 'The quarterly report'
+})
+​
+Stickers
+await client.message.send(jid, {
+  type: 'sticker',
+  media: await readFile('./sticker.webp'),
+  mimetype: 'image/webp'
+})
+For a full sticker pack, use type: 'sticker-pack' with stickers, a trayIcon, and pack metadata (stickerPackId, name, publisher).
+​
+View-once
+Wrap image/video/audio as view-once with the send option:
+await client.message.send(jid, {
+  type: 'image',
+  media: './secret.jpg',
+  mimetype: 'image/jpeg'
+}, {
+  viewOnce: true
+})
+​
+Pre-upload and reuse
+Sometimes you want to encrypt and upload media once and then reference the same descriptor across multiple sends — a broadcast asset, a stock reply, or building a raw proto payload yourself. client.message.upload(source, options) runs the encrypt / media_conn / CDN upload / parse flow the send path uses, but returns the descriptor without sending anything.
+import { readFile } from 'node:fs/promises'
+
+const media = await client.message.upload(await readFile('./photo.jpg'), {
+  type: 'image',
+  mimetype: 'image/jpeg'
+})
+
+// Send it as an image message by spreading the descriptor onto the proto:
+await client.message.send(jid, {
+  imageMessage: {
+    url: media.url,
+    directPath: media.directPath,
+    mediaKey: media.mediaKey,
+    fileSha256: media.fileSha256,
+    fileEncSha256: media.fileEncSha256,
+    fileLength: media.fileLength,
+    mediaKeyTimestamp: media.mediaKeyTimestamp,
+    mimetype: media.mimetype
+  }
+})
+The upload runs against your connected session (the host token comes from a media_conn IQ). Uint8Array sources take a zero-temp-file fast path; a file path or Readable stream is staged to a temp file so the encrypt pass can hash it deterministically.
+​
+WaUploadMediaOptions
+Field	Type	Notes
+type	'image' | 'video' | 'audio' | 'document' | 'sticker' | 'ptv' | 'gif' | 'ptt'	Required. Sets the encryption context and CDN upload path. Unknown types throw before encryption runs.
+mimetype	string	Content-Type for the upload, echoed back on the result for the message proto.
+mediaKey	Uint8Array	Reuse an existing 32-byte media key instead of generating a fresh one.
+sidecar	boolean	Override the streaming sidecar. Default true for video / ptv / audio / gif / ptt, off for the rest.
+firstFrameLength	number	Animated-sticker first-frame length; needed to compute the first-frame sidecar.
+timeoutMs	number	Per-upload transfer timeout override.
+signal	AbortSignal	Cancellation signal forwarded to the CDN request.
+​
+WaMediaUploadResult
+Field	Type	Notes
+url	string	Absolute CDN URL of the uploaded ciphertext.
+directPath	string	Host-relative path — pairs with a media host or feeds downloadMediaMessage.
+mediaKey	Uint8Array	The 32-byte media key used to encrypt. Reuse it in a follow-up call to upload if you want a stable descriptor.
+fileSha256	Uint8Array	SHA-256 of the plaintext.
+fileEncSha256	Uint8Array	SHA-256 of the encrypted ciphertext‖mac.
+fileLength	number	Plaintext byte length.
+mediaKeyTimestamp	number	Unix seconds the media key was minted; belongs on the message proto.
+mimetype	string?	Echo of the option, when provided.
+metadataUrl	string?	Server metadata URL (video).
+streamingSidecar	Uint8Array?	Streaming sidecar for seekable playback, when computed.
+firstFrameSidecar / firstFrameLength	Uint8Array? / number?	Animated-sticker first-frame sidecar echoes.
+mediaKey is sensitive key material — treat it like a password. Don’t log it, ship it to third parties, or persist it in unencrypted stores. Anyone with the key can decrypt the CDN blob.
+​
+Standalone crypto & transfer
+For workflows that need to run encryption/decryption outside a session — a background worker crunching stored ciphertext, a custom relay — WaMediaCrypto and WaMediaTransferClient (plus their result and option types) are re-exported from the package root:
+import { WaMediaCrypto, WaMediaTransferClient } from 'zapo-js'
+Same primitives the upload / download paths use; the coordinator method just wraps them with the session-bound media_conn handshake.
+​
+Downloading incoming media
+The message coordinator decrypts and downloads media from an incoming event. Three flavors are available — prefer the streaming ones:
+client.on('message', async (event) => {
+  if (!event.message?.imageMessage) return
+
+  // Preferred — stream to a file (constant memory)
+  await client.message.downloadToFile(event, './incoming.jpg')
+
+  // Or consume the Readable stream yourself
+  const stream = await client.message.download(event)
+
+  // Avoid for large media — buffers the entire file in memory
+  const bytes = await client.message.downloadBytes(event)
+})
+download() / downloadToFile() stream the media and keep memory flat regardless of size. downloadBytes() materializes the whole file in memory — reach for it only on small media, and cap it with maxBytes.
+All three accept either a WaIncomingMessageEvent or a raw Proto.IMessage, plus optional WaDownloadMediaOptions (for example maxBytes to cap downloadBytes).
+​
+Without a connected client
+downloadMediaMessage is a free function that mirrors client.message.download but does not need a paired session. The encrypted-media metadata travels inside the (already decrypted) message itself, so you can re-download media from a persisted event long after the original socket is gone — useful for offline workers, archive replays, or anything that processes stored messages without spinning up a WaClient.
+import { downloadMediaMessage } from 'zapo-js'
+import { createWriteStream } from 'node:fs'
+
+const stream = await downloadMediaMessage(event)
+stream.pipe(createWriteStream('photo.jpg'))
+Accepts a WaIncomingMessageEvent or a raw Proto.IMessage, returns a Readable you own (pipe it or .destroy() it — an unconsumed stream leaks the socket). MAC + SHA-256 verification runs as bytes are consumed, same semantics as the coordinator method. Throws when the message has no downloadable media.
+Option	Type	Notes
+transfer	WaMediaTransferClient	Reuse an existing transfer client — inherits its proxy agents, timeouts, and MAC-verification toggle, and avoids spinning up a new HTTP client per call in a loop. A stateless one is created when omitted (fine for one-offs).
+proxy	WaProxyTransport	Per-call proxy for the CDN download leg, mirroring the client’s proxy.mediaDownload. The fetch runs over node:http/node:https, so only the http.Agent form is honored — an undici dispatcher is ignored. Takes precedence over the default agent of a transfer you pass.
+signal / timeoutMs / maxBytes	(from WaDownloadMediaOptions)	Same semantics as the coordinator methods.
+For lower-level access — when you want to do the CDN fetch yourself, hand the keys to another process, or just inspect what’s downloadable — resolveMediaPayload returns the keys + hashes without doing any I/O:
+import { resolveMediaPayload } from 'zapo-js'
+
+const payload = resolveMediaPayload(event.message)
+// → WaResolvedMediaPayload | null
+// { mediaType, directPath, mediaKey, fileSha256?, fileEncSha256?, mimetype?, fileLength? }
+Returns null when the message has no downloadable media, or when the proto carried no directPath / mediaKey. It unwraps ephemeralMessage, viewOnceMessage / viewOnceMessageV2, and documentWithCaptionMessage before resolving. Supported kinds: image, video (gif when gifPlayback), audio (ptt when ptt), document, sticker, ptv.
+payload.mediaKey is the AES/MAC seed for the encrypted blob — treat it like a secret. Don’t log it, don’t put it in error messages, and don’t ship it to a third-party service unless that’s the whole point of your pipeline.
+​
+Requesting a reupload
+The CDN drops old media blobs — a download* on a message surfaced by history sync can answer 404/410 well after the original send. client.message.requestMediaReupload() runs the round-trip WhatsApp Web uses to recover: encrypt a server-error receipt with the message’s media key, send it as an ack, and await the mediaretry notification the sender’s primary device answers with. On success only the directPath changes — the media key, hashes, and length of the original message stay valid, so downloading with a spread of the new path works.
+client.on('message', async (event) => {
+  const image = event.message?.imageMessage
+  if (!image) return
+
+  try {
+    await client.message.downloadToFile(event, './incoming.jpg')
+  } catch {
+    // Old blob expired — ask the sender to re-serve it
+    const retry = await client.message.requestMediaReupload(event)
+    if (retry.result !== 'success') {
+      console.warn('reupload', retry.result) // 'not_found' | 'decryption_error' | 'general_error'
+      return
+    }
+    await client.message.downloadToFile(
+      { imageMessage: { ...image, directPath: retry.directPath } },
+      './incoming.jpg'
+    )
+  }
+})
+Pass an explicit WaMediaRetryRequest ({ messageId, chatJid, mediaKey, fromMe, participant? }) when you hold the ids and the media key but not the decoded message — the event form pulls those out for you and rejects newsletter messages plus messages with no downloadable media. options.timeoutMs bounds the wait for the notification; the coordinator does not throw on not_found / general_error (the sender no longer holds the file, or the primary could not re-seal it) — check result.result for one of 'success' | 'not_found' | 'decryption_error' | 'general_error'.
+Requests are deduplicated by messageId: concurrent calls for the same message share one round-trip and one server-error receipt.
+​
+Media processing
+For proper media, use a media processor. Install @zapo-js/media-utils and pass one through the media client option — it probes and processes media (dimensions, duration, thumbnails, waveforms, voice-note normalization) before upload. Without it, media still uploads but lacks this processing:
+import { createMediaProcessor } from '@zapo-js/media-utils'
+
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  media: {
+    processor: createMediaProcessor(),
+    generateThumbnail: true,
+    generateWaveform: true,
+    normalizeVoiceNote: true
+  }
+}, logger)
+@zapo-js/media-utils shells out to ffmpeg/ffprobe and uses sharp. Make sure those binaries are available in your environment.
