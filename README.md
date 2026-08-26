@@ -1681,3 +1681,337 @@ client.on('debug_decrypted_payload', ({ encIndex, encType, plaintext }) => {
 })
 Costs nothing when nobody is subscribed — the plaintext copy is only built when at least one listener is attached. Useful for recording traffic for faithful replay (re-encoding a decoded message does not reproduce the original bytes), or decoding with a newer protobuf than the library carries. A listener that throws is swallowed and logged, so a buggy observer cannot poison delivery.
 Mobile-registration events (mobile_registration_code, mobile_account_takeover_notice) exist for the mobile-registration path and are not part of the standard companion flow.
+
+Stores
+
+Persist authentication state, Signal sessions, and per-domain protocol data through zapo’s pluggable store interface and bundled backend packages.
+
+A store is where zapo persists everything a session needs to survive a restart: pairing credentials, Signal protocol state, app-state collections, and optionally your message/thread/contact archive. You build one with createStore and pass it to the client.
+import { createStore } from 'zapo-js'
+import { createSqliteStore } from '@zapo-js/store-sqlite'
+
+const store = createStore({
+  backends: {
+    sqlite: createSqliteStore({ path: '.auth/state.sqlite', driver: 'auto' })
+  },
+  providers: {
+    auth: 'sqlite',
+    signal: 'sqlite',
+    preKey: 'sqlite',
+    session: 'sqlite',
+    identity: 'sqlite',
+    senderKey: 'sqlite',
+    appState: 'sqlite',
+    privacyToken: 'sqlite',
+    messages: 'sqlite',
+    threads: 'sqlite',
+    contacts: 'sqlite'
+  }
+})
+​
+The model
+createStore separates backends (where data lives) from providers (which backend each domain uses). This lets you mix backends — e.g. keep hot signal state in Redis while archiving messages in Postgres.
+createStore({
+  backends: {
+    redis: createRedisStore({ redis }),
+    postgres: createPostgresStore({ pool })
+  },
+  providers: {
+    auth: 'redis',
+    signal: 'redis',
+    preKey: 'redis',
+    session: 'redis',
+    identity: 'redis',
+    senderKey: 'redis',
+    appState: 'redis',
+    privacyToken: 'redis',
+    messages: 'postgres',
+    threads: 'postgres',
+    contacts: 'postgres'
+  }
+})
+​
+Providers are required when you set backends
+As soon as backends contains at least one entry, every persistence domain must be assigned explicitly in providers. The required domains are auth, signal, preKey, session, identity, senderKey, appState, privacyToken, messages, threads, and contacts. Both the TypeScript types and a runtime check enforce this — createStore throws and lists the missing providers.* keys when any are omitted.
+Three values are valid for each domain:
+A backend name from backends (e.g. 'sqlite') — persist that domain there.
+'memory' — keep that domain in the in-tree memory provider for this run.
+'none' — only valid for the optional archive domains (messages, threads, contacts); skips the domain entirely.
+This guard exists because partial coverage is almost always a bug. If you persist only auth and let Signal state, app-state, or the mailbox fall back to memory, the device pairs once and then loses its protocol state on every restart. Pick 'memory' deliberately when that is what you want.
+createStore({
+  backends: { sqlite: createSqliteStore({ path: '.auth/state.sqlite' }) },
+  providers: {
+    auth: 'sqlite',
+    signal: 'sqlite',
+    preKey: 'sqlite',
+    session: 'sqlite',
+    identity: 'sqlite',
+    senderKey: 'sqlite',
+    appState: 'sqlite',
+    privacyToken: 'sqlite',
+    messages: 'none',  // skip the message archive
+    threads: 'none',
+    contacts: 'none'
+  }
+})
+When backends is empty or omitted, every domain falls back to memory (mailbox domains to 'none') — useful for tests, but the device re-pairs on every restart.
+​
+Persisted domains
+These hold the state required to keep a session alive. Back them with a durable backend in production.
+Domain	Holds
+auth	Pairing credentials and device identity. Persist this.
+signal	Signal sessions (umbrella over the sub-stores below).
+preKey	Signal pre-keys.
+session	Signal sessions.
+identity	Signal identity keys.
+senderKey	Group sender keys.
+appState	App-state collections (mute, pin, read, archive, …).
+privacyToken	Trusted-contact / privacy tokens.
+​
+Optional archive domains
+These accept 'none' to disable persistence entirely:
+Domain	Holds
+messages	Message archive (B | 'memory' | 'none').
+threads	Thread metadata.
+contacts	Contact directory.
+​
+Cache domains
+Configured under cacheProviders and default to bounded memory with TTLs:
+Domain	Holds	Default
+retry	Outbound message retry queue.	'memory'
+groupMetadata	Group metadata cache.	'memory'
+chatMetadata	Protocol-derived per-chat state (disappearing-message settings). Read on every 1:1 send to stamp contextInfo; rebuilt from history sync, EPHEMERAL_SETTING messages and incoming ContextInfo, so losing it costs freshness rather than data.	'memory'
+deviceList	Device list cache.	'memory'
+messageSecret	Message-secret cache for addons.	'memory'
+createStore({
+  backends: { sqlite },
+  providers: { /* ... */ },
+  cacheProviders: { groupMetadata: 'sqlite', deviceList: 'sqlite' },
+  memory: {
+    cacheTtlMs: { groupMetadataMs: 600_000, deviceListMs: 600_000 }
+  }
+})
+Each backend evicts expired entries differently: memory runs an in-process sweep, Redis and MongoDB use native TTL, SQLite filters on read, and PostgreSQL/MySQL require an opt-in poller (result.startCleanup(sessionId)) or cache tables grow forever. See Cache expiry and cleanup for the per-backend matrix.
+​
+Read-through cache layer
+When a hot signal domain points at a persistent backend, every send/recv round-trip pays the backend’s latency to fetch the same peer’s session, identity, or sender key. The cacheLayer option wraps the backend store with a bounded-LRU L1 (the in-tree memory provider) so repeated reads of the same peer skip the backend, while writes stay write-through so the backend remains authoritative.
+Four hot domains can be cached:
+Domain	Strategy
+session	Signal Double-Ratchet sessions. Read-through + write-through.
+identity	Remote identity keys. Read-through + write-through.
+senderKey	Per-(group, sender) sender keys. Read-through + write-through.
+privacyToken	Trusted-contact tokens. Read-through + invalidate-on-write (the backend merges partial fields on upsert).
+All flags default to false. A flag is a no-op unless that domain resolves to a real backend in providers — caching 'memory' or 'none' in front of itself buys nothing and is skipped.
+createStore({
+  backends: { postgres, redis },
+  providers: {
+    auth: 'postgres',
+    signal: 'postgres',
+    preKey: 'postgres',
+    session: 'postgres',
+    identity: 'postgres',
+    senderKey: 'postgres',
+    appState: 'postgres',
+    privacyToken: 'postgres',
+    messages: 'postgres',
+    threads: 'postgres',
+    contacts: 'postgres'
+  },
+  cacheLayer: {
+    session: true,
+    identity: true,
+    senderKey: true,
+    privacyToken: true,
+    limits: {
+      session: 10_000,
+      identity: 10_000,
+      senderKey: 5_000,
+      privacyToken: 5_000
+    }
+  }
+})
+limits caps per-domain entry counts; once exceeded, the L1 evicts LRU. When unset, each domain defaults to the matching memory-provider cap.
+​
+When to enable it
+Turn it on when your backend is a network hop (Redis, Postgres, MySQL, MongoDB) and you send or receive at a rate where the same peers repeat — typical for bots, group fan-out, and multi-tenant gateways. With a local SQLite backend the wins are smaller; measure before flipping it on.
+​
+Single-writer assumption
+The L1 is per-process and has no cross-process invalidation channel. Enable cacheLayer only when a single process owns a given sessionId’s backend rows — the library’s standard connection model. Different sessions sharing one backend are fine; the same session opened from two processes is not.
+Do not enable cacheLayer when multiple processes share one backend for the same sessionId. Another process’s writes would leave this cache stale and corrupt the Signal ratchet.
+​
+Why not every domain?
+signal, appState, and preKey are deliberately excluded:
+signal — the per-send registration read is already memoized inside the signal lock; a second cache adds nothing.
+appState — the sync client already caches collection state for the sync-context lifetime, the only scope where reads both repeat and stay coherent.
+preKey — one-time pre-keys are read exactly once then consumed. Serving a consumed key from a stale cache would reuse it and break forward secrecy.
+​
+Backends
+SQLite
+@zapo-js/store-sqlite — local, single-process.
+PostgreSQL
+@zapo-js/store-postgres — distributed, relational.
+MySQL
+@zapo-js/store-mysql — distributed, relational.
+Redis
+@zapo-js/store-redis — cache + persistence.
+MongoDB
+@zapo-js/store-mongo — document store.
+Memory
+Built in. Great for tests; does not survive a restart.
+See the stores reference for each backend’s config options.
+​
+Memory-only (tests)
+For quick experiments or tests, omit backends entirely — every domain falls back to memory:
+const store = createStore({})
+const client = new WaClient({ store, sessionId: 'test' }, logger)
+A memory-only store loses all credentials on restart, so you re-pair every boot. Use a durable backend for anything long-lived.
+​
+Custom backends
+The backend contract is WaStoreBackend<S, C>, parametrized by the persistence domains (S extends WaStoreDomain) and cache domains (C extends WaCacheDomain) the bundle actually implements. Both default to the full matrix, so a bare WaStoreBackend still means every domain — that’s what every in-tree @zapo-js/store-* package ships.
+To cover part of the matrix, name the domains you implement:
+import type { WaStoreBackend } from 'zapo-js'
+
+const vault = {
+  stores: { auth: (sessionId: string) => new MyAuthStore(sessionId) },
+  caches: {}
+} satisfies WaStoreBackend<'auth', never>
+
+createStore({
+  backends: { vault, sqlite },
+  providers: {
+    auth: 'vault',       // ok — vault declares 'auth'
+    signal: 'sqlite',
+    // signal: 'vault',  // compile error — vault does not declare 'signal'
+    // ...
+  }
+})
+createStore() now infers the backend map (not just the backend names), so routing an undeclared domain — or misspelling a backend name — fails at compile time instead of throwing does not provide <kind>.<domain> on the first session(). The mandatory coverage of every persistence domain once backends is set is unchanged, and 'none' still resolves to the noop store.
+A hand-written full backend has to declare the new chatMetadata cache alongside the other cache domains, or narrow itself with WaStoreBackend<S, C>. A bare satisfies WaStoreBackend without the cache factory no longer compiles.
+A hand-written WaContactStore needs to read and write the new WaStoredContactRecord.username field — the contact handle without the display-only @, populated when the server surfaces one. The in-tree @zapo-js/store-* packages migrate their schemas automatically on connect (via ensurePgMigrations and its per-backend siblings), so consumers of those packages do not need to do anything.
+
+Sending messages
+
+
+Send WhatsApp text, threaded replies, mentions, and rich link previews with client.message.send, the typed entry point for all outgoing content.
+
+All outgoing content goes through a single method:
+client.message.send(to, content, options?): Promise<WaMessagePublishResult>
+to — the recipient JID (5511999999999@s.whatsapp.net, a group ...@g.us, etc.). See JID helpers for building these.
+content — a string, a typed content object, or a raw Proto.IMessage.
+options — quoting, mentions, forwarding, view-once, edits, and more.
+The promise resolves to a WaMessagePublishResult once the server acks:
+const result = await client.message.send(jid, 'Hello!')
+console.log(result.id) // the message id (stanza id)
+​
+Plain text
+The simplest content is a string:
+await client.message.send(jid, 'Hello from zapo!')
+For more control, use the text object form — it lets you attach context info and tune link previews:
+await client.message.send(jid, {
+  type: 'text',
+  text: 'Check this out: https://example.com',
+  linkPreview: true // auto-fetch a preview
+})
+​
+Replying (quoting)
+Pass the original message event (or a reference) as options.quote:
+client.on('message', async (event) => {
+  await client.message.send(event.key.remoteJid, 'Replying to you', {
+    quote: event
+  })
+})
+The quote is rendered as a reply bubble referencing the original message.
+​
+Mentions
+options.mentions is a list of JIDs to tag. Include the matching @number text in the body so WhatsApp renders the mention:
+await client.message.send(groupJid, {
+  type: 'text',
+  text: 'Hey @5511999999999, welcome!'
+}, {
+  mentions: ['5511999999999@s.whatsapp.net']
+})
+​
+Link previews
+Link-preview behavior is controlled per message via the text object’s linkPreview field:
+Value	Behavior
+undefined	Follow the global linkPreview default.
+false	Disable the preview.
+true	Force auto-fetch of the preview.
+object	Skip the fetch and use the provided preview fields directly.
+// Provide your own preview instead of fetching
+await client.message.send(jid, {
+  type: 'text',
+  text: 'https://example.com',
+  linkPreview: { title: 'Example', description: 'My custom preview' }
+})
+Configure the default fetcher globally with the linkPreview client option.
+​
+Forwarding
+Set options.forward to mark a message as forwarded:
+await client.message.send(jid, 'Forwarded text', { forward: true })
+// or with a frequently-forwarded score
+await client.message.send(jid, content, { forward: { score: 4 } })
+​
+Send options reference
+WaSendMessageOptions (third argument) includes:
+Option	Type	Purpose
+quote	WaIncomingMessageEvent | WaQuoteRef | WaMessageKey	Reply to a message — pass the event verbatim, its key, or a WaQuoteRef.
+mentions	string[]	JIDs to mention.
+forward	boolean | { score }	Mark as forwarded.
+viewOnce	boolean	Wrap image/video/audio as view-once.
+editKey	WaMessageKey | WaSendEditKey | WaMessageRef	Edit a previously sent message (see interactive).
+expirationSeconds	number	Disappearing-message TTL for this message. Wins over contextInfo.expirationSeconds and over the automatic group-ephemeral inject (the latter is short-circuited as soon as this is defined — even 0).
+disableGroupEphemeralAutoInject	boolean	Skip the automatic ephemeral-setting injection on group sends (expiration and disappearingMode from the group metadata cache). No effect on 1:1. Redundant when expirationSeconds is set.
+disableDirectEphemeralAutoInject	boolean	Skip the automatic ephemeral-setting injection on 1:1 sends (expiration, ephemeralSettingTimestamp and disappearingMode from the chatMetadata cache) — also skips the cache lookup. No effect on groups. Redundant when expirationSeconds is set.
+contextInfo	WaSendContextInfo	Raw context info (advanced).
+id	string	Use a specific message id.
+ackTimeoutMs / maxAttempts / retryDelayMs	number	Per-send retry tuning.
+To send a single message with no expiration into a group with disappearing-mode on, prefer disableGroupEphemeralAutoInject: true over expirationSeconds: 0 — the latter still writes expiration=0 into the outgoing contextInfo. Same story for disableDirectEphemeralAutoInject in 1:1 chats.
+​
+Sending to a username
+A username handle (@alice) is not an addressable JID on its own. Resolve it to the account’s LID with client.profile.resolveUsername first, then send to that JID — the send API takes the JID exactly like any other 1:1 recipient.
+resolveUsername returns a discriminated union you have to switch on. Every case has a next step:
+const result = await client.profile.resolveUsername({ username: '@alice' })
+
+switch (result.status) {
+  case 'found':
+    // result.jid is the LID (@lid) to address; result.pnJid is the phone-jid
+    // form when the server knows it, and result.isBusiness flags a business
+    // account. result.username is the canonical handle the server echoes back.
+    await client.message.send(result.jid, 'hi')
+    break
+
+  case 'key-required': {
+    // The server withheld the JID until the 4-digit recovery key is supplied.
+    // Ask the user for it (out of band — WhatsApp UI shows it as "@handle:1234")
+    // and retry with the key. A one-off '@user:1234' input works too:
+    // resolveUsername parses the ':1234' suffix into usernameKey for you.
+    const usernameKey = await askUserForFourDigitKey() // your UI
+    const retry = await client.profile.resolveUsername({ username: '@alice', usernameKey })
+    if (retry.status === 'found') await client.message.send(retry.jid, 'hi')
+    else if (retry.status === 'key-required') console.log('wrong key')
+    else console.log('no such handle')
+    break
+  }
+
+  case 'not-found':
+    // Terminal — the handle is not registered on WhatsApp. No retry recovers it.
+    console.log('no such handle')
+    break
+}
+resolveUsername throws before any round-trip when the handle or the key fails local validation (bad characters, wrong length, reserved word, key that is not exactly 4 digits) — so a call that returns has passed local rules and the status reflects the server-side outcome.
+​
+The content union
+content accepts any WaSendMessageContent. The typed variants are documented across these guides:
+Media
+Images, video, audio, documents, stickers.
+Polls & reactions
+Polls, votes, reactions, pins, edits, revokes, events.
+You can always drop down to a raw Proto.IMessage for anything not covered by a typed builder:
+import { proto } from 'zapo-js'
+
+await client.message.send(jid, {
+  conversation: 'Raw protobuf message'
+})
+Content types without a typed builder yet — locations, contact vCards, and Business PIX / review-and-pay payment cards — are documented in Raw proto sends.
+The full set of recognized Proto.IMessage fields (location, live location, contacts, group invite, product, order, …) is listed in the message types reference.
