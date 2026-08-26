@@ -1380,3 +1380,151 @@ testHooks?: WaClientTestHooks — test-only fixtures (e.g. a custom Noise root C
 ​
 Dangerous options
 dangerous flags each disable a security check the production path enforces (signature verification, app-state MAC checks, …). They exist for testing against a fake server. Never enable them in production.
+
+Plugins
+
+Extend WaClient with typed plugins: register stanza handlers, expose new coordinators at client[exposeAs], and contribute typed events that only exist when the plugin is installed.
+
+The plugin system lets you extend WaClient without forking it. A plugin can hook into the incoming stanza pipeline, expose its own coordinator at client[exposeAs], contribute typed events to client.on, and clean up on disconnect — all with full TypeScript inference, no global module augmentation.
+@zapo-js/voip is the reference implementation; see the VoIP guide for what a finished plugin looks like.
+​
+What a plugin is
+Every plugin is a WaClientPluginDefinition value passed via the plugins option:
+new WaClient({ store, sessionId: 'default', plugins: [myPlugin()] }, logger)
+There are two flavors:
+Behavior plugins run side effects (register stanza handlers, listen to events, schedule work) and don’t expose anything on the client.
+Expose plugins also publish a value at client[exposeAs] — typically a coordinator object, like client.voip.
+Both flavors can contribute typed events that surface on client.on / client.once / client.off only when the plugin is in the plugins array. The inference is value-derived: if the plugin is not installed, the event name doesn’t exist on the client type.
+​
+Authoring a plugin
+Use defineWaClientPlugin for type-safe authoring. It has two overloads.
+​
+Behavior plugin
+import { defineWaClientPlugin } from 'zapo-js'
+
+export function loggingPlugin() {
+  return defineWaClientPlugin({
+    id: 'example/logging',
+    setup(ctx) {
+      const unregister = ctx.registerIncomingHandler({
+        tag: 'message',
+        handler: async (node) => {
+          ctx.logger.info('saw <message>', { from: node.attrs.from })
+          // return false so the core handler still runs
+          return false
+        }
+      })
+      ctx.registerDispose(() => unregister())
+    }
+  })
+}
+​
+Expose plugin
+The expose overload takes three type parameters: the exposeAs key as a string literal, the type of the value returned by setup, and the event-map type. Inference flows from the value back into client.on and client[exposeAs]:
+import { defineWaClientPlugin } from 'zapo-js'
+
+interface MetricsEvents {
+  readonly metrics_tick: (payload: { readonly count: number }) => void
+}
+
+class Metrics {
+  count = 0
+  increment(): void {
+    this.count += 1
+  }
+}
+
+export function metricsPlugin() {
+  return defineWaClientPlugin<'metrics', Metrics, MetricsEvents>({
+    id: 'example/metrics',
+    exposeAs: 'metrics',
+    setup(ctx) {
+      const metrics = new Metrics()
+      const interval = setInterval(() => {
+        ctx.emit('metrics_tick', { count: metrics.count })
+      }, 1000)
+      ctx.registerDispose(() => clearInterval(interval))
+      return metrics
+    },
+    dispose(metrics) {
+      // metrics is typed as Metrics here
+      metrics.count = 0
+    }
+  })
+}
+Once you wire metricsPlugin() into plugins, client.metrics is typed as Metrics, and client.on('metrics_tick', ...) is type-checked against MetricsEvents.
+The exposeAs parameter is constrained to K extends keyof WaClient ? never : K. Trying to expose a name that already exists on the client — 'message', 'group', 'voip' if voip is also installed — is a TypeScript error at the call site.
+​
+Plugin context
+setup receives a WaClientPluginContext:
+Field	Type	What it gives you
+client	WaClient	The host client, for late binding (handlers can read client.getCredentials(), etc.).
+options	Readonly<WaClientOptions>	The exact options the client was constructed with.
+logger	Logger	Child logger already tagged with { plugin: id }.
+stores	session stores	Same per-session domains the coordinators use.
+deps	WaClientDependencies	Coordinator dependency graph (advanced).
+emit	function	Emit a (typed) event on the host client.
+on / off / once	functions	Subscribe to events on the host client.
+queryWithContext	function	Send an IQ-style query and await the response node.
+registerIncomingHandler	function	Hook the incoming stanza pipeline; see below.
+registerIncomingStanzaFilter	function	Drop or rewrite stanzas before the core handlers run.
+registerDispose	function	Schedule a teardown callback. Runs LIFO on WaClient.disconnect.
+ctx.deps is an advanced API for plugin authors — new coordinators may appear in minor releases. Some nested coordinators reach key material, so do not log or persist deps wholesale.
+​
+Incoming handlers
+registerIncomingHandler({ tag, prepend, handler }) lets you intercept a specific stanza tag ('message', 'iq', 'call', 'ack', 'receipt', …). Return true from handler to signal you handled the stanza (the core client won’t ack again); return false to let the rest of the pipeline run.
+ctx.registerIncomingHandler({
+  tag: 'call',
+  prepend: true,
+  handler: async (node) => {
+    // run before the core handler; returning true claims the stanza
+    return true
+  }
+})
+registerIncomingStanzaFilter runs even earlier and can drop stanzas entirely.
+​
+Typed event extension
+Plugins thread their events into the host client through a phantom __pluginEvents marker carried by the return value of defineWaClientPlugin. The third generic parameter is the event map:
+defineWaClientPlugin<'voip', WaVoipCoordinator, VoipEvents>({ /* ... */ })
+WaClient’s event type is derived from the plugins tuple via WaClientPluginEventsFromPlugins. The practical effect: a voip_* event exists on client.on only when voipPlugin() is in plugins.
+const client = new WaClient({
+  store,
+  sessionId: 'default',
+  plugins: [voipPlugin()]
+}, logger)
+
+// OK: voipPlugin contributes voip_call_incoming
+client.on('voip_call_incoming', (call) => { /* ... */ })
+
+// Without voipPlugin() in plugins, the line above is a type error.
+There is no global module augmentation — installing a different WaClient in the same project doesn’t inherit foreign plugin events.
+​
+Lifecycle
+Plugins install during new WaClient(...):
+The client is constructed and its coordinators wired.
+installWaClientPlugins iterates the plugins array in order. For each plugin:
+The id is checked against previously seen ids.
+If exposeAs is set, the name is checked against other plugins and against existing members of WaClient.
+setup(ctx) runs. The return value (for expose plugins) is published as a non-configurable, non-writable getter on the client.
+On client.disconnect(), after incoming handlers drain, the registered dispose callbacks run in reverse (LIFO) order. A throwing dispose is logged and the rest still run.
+On the next client.connect(), plugins are reinstalled from scratch — the previous disconnect() disposed them, so connect() runs setup(ctx) again. client[exposeAs] accessors keep working across a reconnect (they resolve against the freshly-installed coordinator instance), and setup sees a clean context every time.
+​
+Error conditions
+installWaClientPlugins throws synchronously during client construction in these cases:
+Duplicate id — "duplicate wa client plugin id: <id>". Each plugin must have a unique id across the plugins array.
+Duplicate exposeAs — "duplicate wa client plugin exposeAs: <name>". Two expose plugins cannot publish the same name.
+Collision with a built-in — "wa client plugin exposeAs \"<name>\" collides with a reserved client member". Trying exposeAs: 'message', 'group', 'on', etc. fails at runtime (and at compile time via the keyof WaClient guard).
+// throws: duplicate wa client plugin id
+new WaClient({
+  store,
+  sessionId: 'default',
+  plugins: [voipPlugin(), voipPlugin()]
+})
+
+// throws: collides with a reserved client member
+const badPlugin = defineWaClientPlugin({
+  id: 'example/bad',
+  exposeAs: 'message' as never,
+  setup: () => ({})
+})
+​
